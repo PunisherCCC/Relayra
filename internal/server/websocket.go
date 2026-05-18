@@ -66,6 +66,7 @@ func (h *Handlers) WebSocket(w http.ResponseWriter, r *http.Request) {
 			_ = writeServerWebSocketClose(conn, h.cfg, websocket.CloseGoingAway, "read failure")
 			return
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(h.cfg.WSIdleTimeoutDuration()))
 
 		var pollReq models.PollRequest
 		if err := json.Unmarshal(message, &pollReq); err != nil {

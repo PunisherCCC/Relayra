@@ -188,8 +188,6 @@ func doPollCycleHTTP(ctx context.Context, cfg *config.Config, rdb store.Backend,
 	}
 	defer resp.Body.Close()
 
-	proxyMgr.MarkSuccess(ctx, proxyURL)
-
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to read poll response", "error", err)
@@ -219,6 +217,8 @@ func doPollCycleHTTP(ctx context.Context, cfg *config.Config, rdb store.Backend,
 		slog.ErrorContext(ctx, "failed to process poll response", "error", err)
 		return false
 	}
+
+	proxyMgr.MarkSuccess(ctx, proxyURL)
 
 	duration := time.Since(start)
 	slog.InfoContext(ctx, "poll cycle completed",

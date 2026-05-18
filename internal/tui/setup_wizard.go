@@ -429,7 +429,7 @@ func (w *SetupWizard) View() string {
 		descs := []string{
 			"Periodic polling on a fixed interval",
 			"HTTP long-polling with hold-open requests",
-			"Persistent WebSocket with automatic long-poll fallback",
+			"Persistent WebSocket with keepalives and optional long-poll fallback",
 		}
 		for i, mode := range modes {
 			cursor := "  "

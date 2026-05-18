@@ -44,10 +44,12 @@ var editableKeys = map[string]bool{
 	"proxy_cooldown_seconds":   true,
 	"transport_chunk_size":     true,
 	"ws_ping_interval":         true,
+	"ws_keepalive_interval":    true,
 	"ws_write_timeout":         true,
 	"ws_idle_timeout":          true,
 	"ws_reconnect_base":        true,
 	"ws_reconnect_max":         true,
+	"ws_longpoll_fallback":     true,
 	"async_workers":            true,
 	"allow_listener_execution": true,
 	"result_ttl":               true,
@@ -86,10 +88,12 @@ func NewSettingsView(cfg *config.Config, rdb store.Backend) *SettingsView {
 		{"Proxy Cooldown Seconds", fmt.Sprintf("%d", cfg.ProxyCooldownSeconds), "proxy_cooldown_seconds"},
 		{"Transport Chunk Size", fmt.Sprintf("%d", cfg.TransportChunkSizeBytes), "transport_chunk_size"},
 		{"WS Ping Interval", fmt.Sprintf("%d", cfg.WSPingInterval), "ws_ping_interval"},
+		{"WS Keepalive Interval", fmt.Sprintf("%d", cfg.WSKeepaliveInterval), "ws_keepalive_interval"},
 		{"WS Write Timeout", fmt.Sprintf("%d", cfg.WSWriteTimeout), "ws_write_timeout"},
 		{"WS Idle Timeout", fmt.Sprintf("%d", cfg.WSIdleTimeout), "ws_idle_timeout"},
 		{"WS Reconnect Base", fmt.Sprintf("%d", cfg.WSReconnectBaseSeconds), "ws_reconnect_base"},
 		{"WS Reconnect Max", fmt.Sprintf("%d", cfg.WSReconnectMaxSeconds), "ws_reconnect_max"},
+		{"WS Long-Poll Fallback", fmt.Sprintf("%t", cfg.WSEnableLongPollFallback), "ws_longpoll_fallback"},
 		{"Async Workers", fmt.Sprintf("%d", cfg.AsyncWorkers), "async_workers"},
 		{"Allow Listener Execution", fmt.Sprintf("%t", cfg.AllowListenerExecution), "allow_listener_execution"},
 		{"Result TTL", fmt.Sprintf("%d", cfg.ResultTTL), "result_ttl"},
@@ -252,6 +256,11 @@ func (sv *SettingsView) applyEdit() tea.Cmd {
 				sv.cfg.WSPingInterval = v
 				sv.items[sv.cursor].Value = newVal
 			}
+		case "ws_keepalive_interval":
+			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {
+				sv.cfg.WSKeepaliveInterval = v
+				sv.items[sv.cursor].Value = newVal
+			}
 		case "ws_write_timeout":
 			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {
 				sv.cfg.WSWriteTimeout = v
@@ -271,6 +280,11 @@ func (sv *SettingsView) applyEdit() tea.Cmd {
 			if v, err := strconv.Atoi(newVal); err == nil && v >= sv.cfg.WSReconnectBaseSeconds {
 				sv.cfg.WSReconnectMaxSeconds = v
 				sv.items[sv.cursor].Value = newVal
+			}
+		case "ws_longpoll_fallback":
+			if v, ok := parseBool(newVal); ok {
+				sv.cfg.WSEnableLongPollFallback = v
+				sv.items[sv.cursor].Value = fmt.Sprintf("%t", v)
 			}
 		case "async_workers":
 			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {

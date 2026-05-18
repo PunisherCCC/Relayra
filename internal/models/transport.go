@@ -33,7 +33,7 @@ type ChunkReceipt struct {
 	Error      string `json:"error,omitempty"`
 }
 
-// ProbeMessage is used by websocket reliability tests to verify end-to-end delivery.
+// ProbeMessage is used by websocket reliability checks and runtime keepalives.
 type ProbeMessage struct {
 	ID        string `json:"id"`
 	Sequence  int    `json:"sequence"`

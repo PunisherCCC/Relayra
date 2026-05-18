@@ -49,7 +49,7 @@ flowchart LR
 | Area | What you get |
 | --- | --- |
 | Pairing | One-time pairing tokens with capability exchange |
-| Transport | Interval polling, long polling, or WebSocket with long-poll fallback |
+| Transport | Interval polling, long polling, or WebSocket with reconnect-first keepalive and optional long-poll fallback |
 | Reliability | WebSocket proxy reliability testing, chunked request transport, queue clearing, and reconnect-aware retries |
 | Security | Encrypted poll payloads and optional API token auth |
 | Execution | Async relay execution and optional listener-side execution |
@@ -173,7 +173,7 @@ Listener-side execution is supported when enabled (`destination_peer_id`: `liste
 - Sender requires outbound connectivity only; inbound access is not required.
 - Pairing uses one-time token exchange and derives encryption keys for payload transport.
 - Poll and WebSocket request/response payloads are encrypted with AES-256-GCM.
-- WebSocket mode now uses configurable ping, idle, write-timeout, and reconnect settings.
+- WebSocket mode now uses configurable ping, keepalive, idle, write-timeout, reconnect, and fallback settings.
 - The sender can measure websocket reliability against the paired listener by sending encrypted probe traffic through each configured proxy.
 - Protected endpoints (`/api/v1/relay`, `/api/v1/result/{id}`, `/api/v1/peers`) enforce Bearer tokens after the first token is created.
 - Open endpoints include `/health`, `/api/v1/poll`, `/api/v1/ws`, `/api/v1/pair`.
@@ -192,10 +192,12 @@ RELAYRA_TRANSPORT_MODE=websocket
 RELAYRA_LONG_POLL_WAIT=30
 RELAYRA_TRANSPORT_CHUNK_SIZE_BYTES=262144
 RELAYRA_WS_PING_INTERVAL=20
+RELAYRA_WS_KEEPALIVE_INTERVAL=5
 RELAYRA_WS_WRITE_TIMEOUT=15
 RELAYRA_WS_IDLE_TIMEOUT=60
 RELAYRA_WS_RECONNECT_BASE_SECONDS=1
 RELAYRA_WS_RECONNECT_MAX_SECONDS=30
+RELAYRA_WS_ENABLE_LONGPOLL_FALLBACK=true
 RELAYRA_PROXY_COOLDOWN_SECONDS=300
 RELAYRA_ALLOW_LISTENER_EXECUTION=false
 ```
@@ -212,6 +214,10 @@ relayra proxy test-websocket --samples 3 --hold 30 --interval 5
 ```
 
 Relayra opens a websocket to the paired listener through each configured proxy, exchanges encrypted probe payloads, and reports a per-proxy reliability score based on connection uptime plus delivered probe acknowledgements.
+
+In normal websocket runtime mode, Relayra also sends small encrypted keepalive probes on a short cadence while idle so production connections do not sit silent long enough to look dead to intermediaries.
+
+If `RELAYRA_WS_ENABLE_LONGPOLL_FALLBACK=false`, websocket mode reconnects directly instead of falling back to HTTP long-poll. Relayra keeps this reconnect loop single-threaded so only one active control connection exists at a time.
 
 The sender proxy detail screen also includes a `Test WebSocket Reliability` action for the currently selected proxy.
 

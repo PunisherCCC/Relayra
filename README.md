@@ -20,6 +20,7 @@ It connects two roles:
 
 Relay payloads are encrypted (`AES-256-GCM`), senders can use proxy chains, and operators can work through both CLI and TUI.
 Relayra now uses durable lease/ack delivery with request/result ID dedupe so transient proxy outages bias toward re-delivery instead of silent loss.
+Large relayed requests can also be chunked across sync cycles so unstable proxies are less likely to drop a single oversized payload.
 
 ## Why Relayra
 
@@ -49,6 +50,7 @@ flowchart LR
 | --- | --- |
 | Pairing | One-time pairing tokens with capability exchange |
 | Transport | Interval polling, long polling, or WebSocket with long-poll fallback |
+| Reliability | WebSocket proxy reliability testing, chunked request transport, queue clearing, and reconnect-aware retries |
 | Security | Encrypted poll payloads and optional API token auth |
 | Execution | Async relay execution and optional listener-side execution |
 | Delivery | Durable leased delivery, reconnect reconciliation, result polling, and webhook callbacks |
@@ -159,6 +161,7 @@ Listener-side execution is supported when enabled (`destination_peer_id`: `liste
 | Connect sender to listener | `relayra pair connect <token>` |
 | Add/list proxies (sender) | `relayra proxy add <url>` / `relayra proxy list` |
 | Test long-poll behavior via proxy | `relayra proxy test-longpoll --samples 3 --wait 30` |
+| Test websocket reliability via proxy | `relayra proxy test-websocket --samples 3 --hold 30 --interval 5` |
 | Create API token (listener) | `relayra token create my-app` |
 | Manage service | `relayra service <command>` |
 |  | `install`, `start`, `stop`, `restart`, `status`, `uninstall` |
@@ -170,6 +173,8 @@ Listener-side execution is supported when enabled (`destination_peer_id`: `liste
 - Sender requires outbound connectivity only; inbound access is not required.
 - Pairing uses one-time token exchange and derives encryption keys for payload transport.
 - Poll and WebSocket request/response payloads are encrypted with AES-256-GCM.
+- WebSocket mode now uses configurable ping, idle, write-timeout, and reconnect settings.
+- The sender can measure websocket reliability against the paired listener by sending encrypted probe traffic through each configured proxy.
 - Protected endpoints (`/api/v1/relay`, `/api/v1/result/{id}`, `/api/v1/peers`) enforce Bearer tokens after the first token is created.
 - Open endpoints include `/health`, `/api/v1/poll`, `/api/v1/ws`, `/api/v1/pair`.
 
@@ -185,11 +190,40 @@ RELAYRA_STORAGE_BACKEND=sqlite
 RELAYRA_SQLITE_PATH=/opt/relayra/relayra.db
 RELAYRA_TRANSPORT_MODE=websocket
 RELAYRA_LONG_POLL_WAIT=30
+RELAYRA_TRANSPORT_CHUNK_SIZE_BYTES=262144
+RELAYRA_WS_PING_INTERVAL=20
+RELAYRA_WS_WRITE_TIMEOUT=15
+RELAYRA_WS_IDLE_TIMEOUT=60
+RELAYRA_WS_RECONNECT_BASE_SECONDS=1
+RELAYRA_WS_RECONNECT_MAX_SECONDS=30
 RELAYRA_PROXY_COOLDOWN_SECONDS=300
 RELAYRA_ALLOW_LISTENER_EXECUTION=false
 ```
 
 Full reference: [.env.example](.env.example)
+
+## WebSocket Reliability Testing
+
+On a sender with a paired listener and configured proxies:
+
+```bash
+relayra proxy test-websocket
+relayra proxy test-websocket --samples 3 --hold 30 --interval 5
+```
+
+Relayra opens a websocket to the paired listener through each configured proxy, exchanges encrypted probe payloads, and reports a per-proxy reliability score based on connection uptime plus delivered probe acknowledgements.
+
+The sender proxy detail screen also includes a `Test WebSocket Reliability` action for the currently selected proxy.
+
+## Large Request Chunking
+
+- Small relay requests still travel in a single encrypted poll payload.
+- Oversized relay requests are split into smaller transport chunks and reassembled on the sender before execution.
+- Chunk progress is durable, duplicate-safe, and reconnect-aware.
+
+## Listener Peer Queue Management
+
+On the listener peer detail screen, each sender peer now includes a `Clear Queue` action that removes queued-only requests for that peer without cancelling already leased/in-flight work.
 
 ## Development
 

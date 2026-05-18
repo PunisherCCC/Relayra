@@ -12,16 +12,16 @@ import (
 )
 
 const (
-	keyPendingResultsSet     = "relayra:pending_results"
-	keyPendingResultPrefix   = "relayra:pending_result:"
-	keySenderRequestSet      = "relayra:sender_requests"
-	keySenderRequestPrefix   = "relayra:sender_request:"
-	requestLeaseUntilField   = "lease_until"
-	resultStatusField        = "delivery_status"
-	resultLeaseUntilField    = "lease_until"
-	senderStateStatusField   = "status"
-	senderStateLeaseField    = "lease_until"
-	senderStateUpdatedField  = "updated_at"
+	keyPendingResultsSet    = "relayra:pending_results"
+	keyPendingResultPrefix  = "relayra:pending_result:"
+	keySenderRequestSet     = "relayra:sender_requests"
+	keySenderRequestPrefix  = "relayra:sender_request:"
+	requestLeaseUntilField  = "lease_until"
+	resultStatusField       = "delivery_status"
+	resultLeaseUntilField   = "lease_until"
+	senderStateStatusField  = "status"
+	senderStateLeaseField   = "lease_until"
+	senderStateUpdatedField = "updated_at"
 )
 
 func (r *Redis) LeaseRequests(ctx context.Context, peerID string, batchSize int, leaseTTL time.Duration) ([]models.RelayRequest, error) {
@@ -69,14 +69,44 @@ func (r *Redis) LeaseRequests(ctx context.Context, peerID string, batchSize int,
 
 		req.Status = models.StatusLeased
 		if err := r.Client.HSet(ctx, reqKey, map[string]interface{}{
-			"status":      string(models.StatusLeased),
+			"status":               string(models.StatusLeased),
 			requestLeaseUntilField: leaseUntil,
-			"data":        mustJSON(req),
+			"data":                 mustJSON(req),
 		}).Err(); err != nil {
 			return requests, fmt.Errorf("lease request: %w", err)
 		}
 
 		requests = append(requests, req)
+	}
+
+	return requests, nil
+}
+
+func (r *Redis) ListActiveLeasedRequests(ctx context.Context, peerID string, batchSize int) ([]models.RelayRequest, error) {
+	queueKey := keyQueuePrefix + peerID
+	ids, err := r.Client.LRange(ctx, queueKey, 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("list active leased requests: %w", err)
+	}
+
+	now := time.Now().Unix()
+	requests := make([]models.RelayRequest, 0, batchSize)
+	for _, id := range ids {
+		if len(requests) >= batchSize {
+			break
+		}
+
+		req, leaseUntil, err := r.loadRequestEnvelope(ctx, id)
+		if err != nil || req == nil {
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if req.Status != models.StatusLeased || leaseUntil <= now {
+			continue
+		}
+		requests = append(requests, *req)
 	}
 
 	return requests, nil
@@ -111,7 +141,7 @@ func (r *Redis) ApplyRequestStates(ctx context.Context, requestStates []models.R
 		}
 
 		if err := r.Client.HSet(ctx, reqKey, map[string]interface{}{
-			"status":      string(status),
+			"status":               string(status),
 			requestLeaseUntilField: leaseUntil,
 		}).Err(); err != nil {
 			return fmt.Errorf("apply request state %s: %w", state.RequestID, err)
@@ -180,6 +210,9 @@ func (r *Redis) AckResults(ctx context.Context, resultIDs []string) error {
 		pipe.Del(ctx, keyPendingResultPrefix+id)
 		pipe.SRem(ctx, keySenderRequestSet, id)
 		pipe.Del(ctx, keySenderRequestPrefix+id)
+		pipe.SRem(ctx, keyChunkReceiptSet, models.RequestTransferID(id))
+		pipe.Del(ctx, keyChunkReceiptPrefix+models.RequestTransferID(id))
+		pipe.Del(ctx, keyInboundChunkPrefix+models.RequestTransferID(id))
 	}
 	_, err := pipe.Exec(ctx)
 	if err != nil {
@@ -299,6 +332,25 @@ func parseSenderRequestState(requestID string, data map[string]string) (*models.
 	}
 
 	return state, nil
+}
+
+func (r *Redis) loadRequestEnvelope(ctx context.Context, requestID string) (*models.RelayRequest, int64, error) {
+	reqKey := keyRequestPrefix + requestID
+	data, err := r.Client.HGetAll(ctx, reqKey).Result()
+	if err == redis.Nil || len(data) == 0 {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("get request metadata %s: %w", requestID, err)
+	}
+
+	var req models.RelayRequest
+	if err := json.Unmarshal([]byte(data["data"]), &req); err != nil {
+		return nil, 0, nil
+	}
+	req.Status = models.RequestStatus(data["status"])
+	leaseUntil, _ := strconv.ParseInt(data[requestLeaseUntilField], 10, 64)
+	return &req, leaseUntil, nil
 }
 
 func mustJSON(v any) string {

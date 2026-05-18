@@ -44,6 +44,7 @@ func (r *Redis) StoreResult(ctx context.Context, result *models.RelayResult, ttl
 	if peerID != "" {
 		pipe.LRem(ctx, keyQueuePrefix+peerID, 0, result.RequestID)
 	}
+	pipe.Del(ctx, keyChunkCursorPrefix+models.RequestTransferID(result.RequestID))
 
 	if _, err := pipe.Exec(ctx); err != nil {
 		slog.ErrorContext(ctx, "failed to store result", "error", err)

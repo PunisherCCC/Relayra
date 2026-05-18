@@ -40,7 +40,9 @@ type Backend interface {
 	StoreRequestMetadata(ctx context.Context, peerID string, req *models.RelayRequest) error
 	EnqueueRequest(ctx context.Context, peerID string, req *models.RelayRequest) error
 	LeaseRequests(ctx context.Context, peerID string, batchSize int, leaseTTL time.Duration) ([]models.RelayRequest, error)
+	ListActiveLeasedRequests(ctx context.Context, peerID string, batchSize int) ([]models.RelayRequest, error)
 	QueueLength(ctx context.Context, peerID string) (int64, error)
+	ClearPeerQueue(ctx context.Context, peerID string) (int64, error)
 	GetRequestStatus(ctx context.Context, requestID string) (models.RequestStatus, error)
 	GetRequestWebhookURL(ctx context.Context, requestID string) (string, error)
 	UpdateRequestStatus(ctx context.Context, requestID string, status models.RequestStatus) error
@@ -56,6 +58,12 @@ type Backend interface {
 	GetSenderRequestState(ctx context.Context, requestID string) (*models.RequestSyncState, error)
 	ListSenderRequestStates(ctx context.Context) ([]models.RequestSyncState, error)
 	DeleteSenderRequestStates(ctx context.Context, requestIDs []string) error
+	StoreInboundChunk(ctx context.Context, chunk models.TransportChunk, ttl time.Duration) (*models.ChunkReceipt, *models.RelayRequest, error)
+	ListChunkReceipts(ctx context.Context) ([]models.ChunkReceipt, error)
+	DeleteChunkReceipt(ctx context.Context, transferID string) error
+	ApplyChunkReceipt(ctx context.Context, receipt models.ChunkReceipt) error
+	GetChunkCursor(ctx context.Context, transferID string) (*models.ChunkCursor, error)
+	DeleteChunkCursor(ctx context.Context, transferID string) error
 
 	StoreResult(ctx context.Context, result *models.RelayResult, ttlSeconds int) error
 	GetResult(ctx context.Context, requestID string) (*models.RelayResult, error)

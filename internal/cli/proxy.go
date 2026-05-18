@@ -25,8 +25,11 @@ var proxyCmd = &cobra.Command{
 }
 
 var (
-	proxyLongPollSamples int
-	proxyLongPollWait    int
+	proxyLongPollSamples   int
+	proxyLongPollWait      int
+	proxyWebSocketSamples  int
+	proxyWebSocketHold     int
+	proxyWebSocketInterval int
 )
 
 var proxyAddCmd = &cobra.Command{
@@ -247,16 +250,71 @@ var proxyTestLongPollCmd = &cobra.Command{
 	},
 }
 
+var proxyTestWebSocketCmd = &cobra.Command{
+	Use:   "test-websocket",
+	Short: "Measure websocket reliability against the paired listener through each proxy",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, rdb, err := loadSenderConfig()
+		if err != nil {
+			return err
+		}
+		defer rdb.Close()
+
+		ctx := logger.WithComponent(context.Background(), "proxy")
+		mgr := proxyPkg.NewManager(rdb, cfg.ProxyCooldown())
+		listener, err := rdb.GetListenerInfo(ctx)
+		if err != nil || listener == nil {
+			return fmt.Errorf("no listener paired. Run 'relayra pair connect <token>' first")
+		}
+
+		list, err := mgr.List(ctx)
+		if err != nil {
+			return err
+		}
+		if len(list) == 0 {
+			fmt.Println("No proxies configured.")
+			return nil
+		}
+
+		fmt.Printf("Websocket reliability test against paired listener %s: %d sample(s), %ds hold, %ds interval\n\n",
+			listener.Address, proxyWebSocketSamples, proxyWebSocketHold, proxyWebSocketInterval)
+
+		for _, p := range list {
+			result, err := proxyPkg.TestWebSocketReliability(ctx, cfg, listener, p.URL, proxyWebSocketSamples, proxyWebSocketHold, proxyWebSocketInterval)
+			fmt.Println(p.URL)
+			if err != nil {
+				fmt.Printf("  FAILED: %v\n\n", err)
+				continue
+			}
+			for _, sample := range result.Samples {
+				reason := sample.DisconnectReason
+				if reason == "" {
+					reason = "completed"
+				}
+				fmt.Printf("  sample %d: handshake=%t held=%.2fs probes=%d/%d score=%d reason=%s\n",
+					sample.Sample, sample.HandshakeOK, sample.AliveDuration.Seconds(), sample.ProbesAcked, sample.ProbesSent, sample.Score, reason)
+			}
+			fmt.Printf("  Reliability score: %d/100 (%s)\n\n", result.Score, result.Grade)
+		}
+
+		return nil
+	},
+}
+
 func init() {
 	proxyCmd.AddCommand(proxyAddCmd)
 	proxyCmd.AddCommand(proxyRemoveCmd)
 	proxyCmd.AddCommand(proxyListCmd)
 	proxyCmd.AddCommand(proxyTestCmd)
 	proxyCmd.AddCommand(proxyTestLongPollCmd)
+	proxyCmd.AddCommand(proxyTestWebSocketCmd)
 	proxyCmd.AddCommand(proxyResetCooldownCmd)
 
 	proxyTestLongPollCmd.Flags().IntVar(&proxyLongPollSamples, "samples", 3, "Number of long-poll samples to run")
 	proxyTestLongPollCmd.Flags().IntVar(&proxyLongPollWait, "wait", 30, "Requested long-poll hold duration in seconds")
+	proxyTestWebSocketCmd.Flags().IntVar(&proxyWebSocketSamples, "samples", 3, "Number of websocket samples to run")
+	proxyTestWebSocketCmd.Flags().IntVar(&proxyWebSocketHold, "hold", 30, "Requested websocket hold duration in seconds")
+	proxyTestWebSocketCmd.Flags().IntVar(&proxyWebSocketInterval, "interval", 5, "Probe interval in seconds")
 }
 
 func loadSenderConfig() (*config.Config, store.Backend, error) {

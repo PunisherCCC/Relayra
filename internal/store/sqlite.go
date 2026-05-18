@@ -125,6 +125,33 @@ func (s *SQLite) initSchema(ctx context.Context) error {
 			lease_until INTEGER NOT NULL DEFAULT 0,
 			updated_at INTEGER NOT NULL DEFAULT 0
 		);`,
+		`CREATE TABLE IF NOT EXISTS chunk_receipts (
+			transfer_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			next_index INTEGER NOT NULL DEFAULT 0,
+			completed INTEGER NOT NULL DEFAULT 0,
+			reset INTEGER NOT NULL DEFAULT 0,
+			error TEXT
+		);`,
+		`CREATE TABLE IF NOT EXISTS chunk_cursors (
+			transfer_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			peer_id TEXT,
+			next_index INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		);`,
+		`CREATE TABLE IF NOT EXISTS inbound_chunks (
+			transfer_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			next_index INTEGER NOT NULL DEFAULT 0,
+			total INTEGER NOT NULL,
+			checksum TEXT NOT NULL,
+			total_size INTEGER NOT NULL,
+			data TEXT NOT NULL DEFAULT '',
+			expires_at INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		);`,
 		`CREATE TABLE IF NOT EXISTS api_tokens (
 			id TEXT PRIMARY KEY,
 			name TEXT NOT NULL,
@@ -155,6 +182,33 @@ func (s *SQLite) initSchema(ctx context.Context) error {
 		`ALTER TABLE pending_results ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE pending_results ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_results_request_id ON pending_results(request_id)`,
+		`CREATE TABLE IF NOT EXISTS chunk_receipts (
+			transfer_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			next_index INTEGER NOT NULL DEFAULT 0,
+			completed INTEGER NOT NULL DEFAULT 0,
+			reset INTEGER NOT NULL DEFAULT 0,
+			error TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS chunk_cursors (
+			transfer_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			peer_id TEXT,
+			next_index INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS inbound_chunks (
+			transfer_id TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			next_index INTEGER NOT NULL DEFAULT 0,
+			total INTEGER NOT NULL,
+			checksum TEXT NOT NULL,
+			total_size INTEGER NOT NULL,
+			data TEXT NOT NULL DEFAULT '',
+			expires_at INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		)`,
 	}
 	for _, migration := range migrations {
 		if _, err := s.db.ExecContext(ctx, migration); err != nil &&
@@ -187,7 +241,8 @@ func (s *SQLite) FlushAll(ctx context.Context) (int64, error) {
 
 	tables := []string{
 		"peers", "pairing_tokens", "listener_info", "requests", "request_queue",
-		"results", "pending_results", "sender_request_states", "api_tokens", "proxies",
+		"results", "pending_results", "sender_request_states", "chunk_receipts", "chunk_cursors",
+		"inbound_chunks", "api_tokens", "proxies",
 	}
 	var total int64
 	for _, table := range tables {
@@ -306,6 +361,9 @@ func (s *SQLite) DeletePeer(ctx context.Context, peerID string) error {
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM request_queue WHERE peer_id = ?`, peerID); err != nil {
 		return fmt.Errorf("delete peer queue: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunk_cursors WHERE peer_id = ?`, peerID); err != nil {
+		return fmt.Errorf("delete peer chunk cursors: %w", err)
 	}
 	return tx.Commit()
 }
@@ -523,6 +581,38 @@ func (s *SQLite) LeaseRequests(ctx context.Context, peerID string, batchSize int
 	return requests, nil
 }
 
+func (s *SQLite) ListActiveLeasedRequests(ctx context.Context, peerID string, batchSize int) ([]models.RelayRequest, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT q.data
+		FROM request_queue q
+		JOIN requests r ON r.id = q.request_id
+		WHERE q.peer_id = ?
+			AND r.status = ?
+			AND COALESCE(r.lease_until, 0) > ?
+		ORDER BY q.seq ASC
+		LIMIT ?
+	`, peerID, string(models.StatusLeased), time.Now().Unix(), batchSize)
+	if err != nil {
+		return nil, fmt.Errorf("list active leased requests: %w", err)
+	}
+	defer rows.Close()
+
+	var requests []models.RelayRequest
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		var req models.RelayRequest
+		if err := json.Unmarshal([]byte(data), &req); err != nil {
+			continue
+		}
+		req.Status = models.StatusLeased
+		requests = append(requests, req)
+	}
+	return requests, rows.Err()
+}
+
 func (s *SQLite) ApplyRequestStates(ctx context.Context, requestStates []models.RequestSyncState) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -576,6 +666,55 @@ func (s *SQLite) QueueLength(ctx context.Context, peerID string) (int64, error) 
 		return 0, err
 	}
 	return count, nil
+}
+
+func (s *SQLite) ClearPeerQueue(ctx context.Context, peerID string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin clear peer queue tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT q.request_id
+		FROM request_queue q
+		JOIN requests r ON r.id = q.request_id
+		WHERE q.peer_id = ? AND r.status = ?
+	`, peerID, string(models.StatusQueued))
+	if err != nil {
+		return 0, fmt.Errorf("query clearable queue items: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return 0, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	for _, id := range ids {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM request_queue WHERE request_id = ?`, id); err != nil {
+			return 0, fmt.Errorf("delete queued request %s: %w", id, err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE requests SET status = ? WHERE id = ?`, string(models.StatusFailed), id); err != nil {
+			return 0, fmt.Errorf("mark cleared request failed %s: %w", id, err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM chunk_cursors WHERE transfer_id = ?`, models.RequestTransferID(id)); err != nil {
+			return 0, fmt.Errorf("delete chunk cursor %s: %w", id, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit clear peer queue tx: %w", err)
+	}
+
+	return int64(len(ids)), nil
 }
 
 func (s *SQLite) GetRequestStatus(ctx context.Context, requestID string) (models.RequestStatus, error) {
@@ -707,6 +846,12 @@ func (s *SQLite) AckResults(ctx context.Context, resultIDs []string) error {
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM sender_request_states WHERE request_id = ?`, id); err != nil {
 			return fmt.Errorf("delete sender request state: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM chunk_receipts WHERE transfer_id = ?`, models.RequestTransferID(id)); err != nil {
+			return fmt.Errorf("delete chunk receipt: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM inbound_chunks WHERE transfer_id = ?`, models.RequestTransferID(id)); err != nil {
+			return fmt.Errorf("delete inbound chunk state: %w", err)
 		}
 	}
 
@@ -852,6 +997,9 @@ func (s *SQLite) StoreResult(ctx context.Context, result *models.RelayResult, tt
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM request_queue WHERE request_id = ?`, result.RequestID); err != nil {
 		return fmt.Errorf("delete completed request from queue: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM chunk_cursors WHERE transfer_id = ?`, models.RequestTransferID(result.RequestID)); err != nil {
+		return fmt.Errorf("delete completed request chunk cursor: %w", err)
 	}
 
 	return tx.Commit()

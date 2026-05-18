@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"time"
@@ -17,7 +15,6 @@ import (
 	"github.com/relayra/relayra/internal/models"
 	"github.com/relayra/relayra/internal/proxy"
 	"github.com/relayra/relayra/internal/store"
-	xproxy "golang.org/x/net/proxy"
 )
 
 func runWebSocketMode(ctx context.Context, cfg *config.Config, rdb store.Backend,
@@ -25,10 +22,10 @@ func runWebSocketMode(ctx context.Context, cfg *config.Config, rdb store.Backend
 	sigCh <-chan os.Signal) error {
 
 	var cycle int64
-	wsBackoff := time.Second
+	wsBackoff := cfg.WSReconnectBaseDuration()
 
 	for {
-		err := runWebSocketSession(ctx, cfg, rdb, listenerInfo, proxyMgr, dispatcher, &cycle, sigCh)
+		stable, err := runWebSocketSession(ctx, cfg, rdb, listenerInfo, proxyMgr, dispatcher, &cycle, sigCh)
 		if err == nil {
 			return nil
 		}
@@ -38,12 +35,23 @@ func runWebSocketMode(ctx context.Context, cfg *config.Config, rdb store.Backend
 
 		slog.WarnContext(ctx, "websocket transport failed, falling back to long-poll",
 			"error", err,
+			"classification", classifyRuntimeWebSocketError(err),
 			"retry_in", wsBackoff,
 		)
 
+		cycle++
+		pollCtx := logger.WithPollCycle(ctx, cycle)
+		_ = doPollCycleHTTP(pollCtx, cfg, rdb, listenerInfo, proxyMgr, dispatcher, true)
+
+		if stable {
+			wsBackoff = cfg.WSReconnectBaseDuration()
+		}
 		retryDeadline := time.Now().Add(wsBackoff)
-		if wsBackoff < 30*time.Second {
+		if wsBackoff < cfg.WSReconnectMaxDuration() {
 			wsBackoff *= 2
+			if wsBackoff > cfg.WSReconnectMaxDuration() {
+				wsBackoff = cfg.WSReconnectMaxDuration()
+			}
 		}
 
 		for time.Now().Before(retryDeadline) {
@@ -59,56 +67,62 @@ func runWebSocketMode(ctx context.Context, cfg *config.Config, rdb store.Backend
 
 func runWebSocketSession(ctx context.Context, cfg *config.Config, rdb store.Backend,
 	listenerInfo *models.Peer, proxyMgr *proxy.Manager, dispatcher *dispatcher,
-	cycle *int64, sigCh <-chan os.Signal) error {
+	cycle *int64, sigCh <-chan os.Signal) (bool, error) {
 
 	_, proxyURL, err := proxyMgr.GetTransport(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	dialer, err := websocketDialerForProxy(proxyURL, cfg.RequestTimeout)
+	dialer, err := proxy.WebSocketDialerForProxy(proxyURL, time.Duration(cfg.RequestTimeout+15)*time.Second)
 	if err != nil {
 		proxyMgr.MarkFailed(ctx, proxyURL)
-		return err
+		return false, err
 	}
 
 	wsURL := fmt.Sprintf("ws://%s/api/v1/ws?peer_id=%s", listenerInfo.Address, url.QueryEscape(listenerInfo.ID))
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		proxyMgr.MarkFailed(ctx, proxyURL)
-		return err
+		return false, err
 	}
 	defer conn.Close()
+
+	sessionCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	proxyMgr.MarkSuccess(ctx, proxyURL)
 	slog.InfoContext(ctx, "websocket transport established", "proxy", proxyURL, "listener", listenerInfo.Address)
 
-	_ = conn.SetReadDeadline(time.Now().Add(pollRequestTimeout(cfg, true) + 30*time.Second))
+	setWebSocketReadDeadline(conn, cfg)
 	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(pollRequestTimeout(cfg, true) + 30*time.Second))
+		return setWebSocketReadDeadline(conn, cfg)
 	})
 
-	pingTicker := time.NewTicker(20 * time.Second)
+	pingTicker := time.NewTicker(cfg.WSPingIntervalDuration())
 	defer pingTicker.Stop()
 
 	go func() {
 		for {
 			select {
 			case <-pingTicker.C:
-				_ = conn.WriteControl(websocket.PingMessage, []byte("relayra"), time.Now().Add(5*time.Second))
-			case <-ctx.Done():
+				_ = conn.WriteControl(websocket.PingMessage, []byte("relayra"), time.Now().Add(cfg.WSWriteTimeoutDuration()))
+			case <-sessionCtx.Done():
 				return
 			}
 		}
 	}()
 
+	stable := false
 	for {
 		select {
 		case sig := <-sigCh:
 			slog.InfoContext(ctx, "shutdown signal received", "signal", sig)
-			return nil
+			_ = writeWebSocketClose(conn, cfg, websocket.CloseNormalClosure, "shutdown")
+			return true, nil
 		case <-ctx.Done():
-			return nil
+			_ = writeWebSocketClose(conn, cfg, websocket.CloseNormalClosure, "context cancelled")
+			return true, nil
 		default:
 		}
 
@@ -117,11 +131,13 @@ func runWebSocketSession(ctx context.Context, cfg *config.Config, rdb store.Back
 
 		payloadUp, leasedResults, err := buildPayloadUp(pollCtx, cfg, rdb)
 		if err != nil {
-			return err
+			proxyMgr.MarkFailed(pollCtx, proxyURL)
+			return stable, err
 		}
 		ciphertext, nonce, timestamp, err := crypto.EncryptJSON(listenerInfo.EncryptionKey, payloadUp)
 		if err != nil {
-			return err
+			proxyMgr.MarkFailed(pollCtx, proxyURL)
+			return stable, err
 		}
 
 		req := models.PollRequest{
@@ -132,80 +148,64 @@ func runWebSocketSession(ctx context.Context, cfg *config.Config, rdb store.Back
 			WaitSeconds: requestedPollWait(cfg, dispatcher, true),
 		}
 
-		_ = conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+		_ = conn.SetWriteDeadline(time.Now().Add(cfg.WSWriteTimeoutDuration()))
 		if err := conn.WriteJSON(req); err != nil {
 			proxyMgr.MarkFailed(pollCtx, proxyURL)
-			return err
+			return stable, err
 		}
 
 		var resp models.PollResponse
 		if err := conn.ReadJSON(&resp); err != nil {
 			proxyMgr.MarkFailed(pollCtx, proxyURL)
-			return err
+			return stable, err
 		}
 
 		var payloadDown models.PollPayloadDown
 		if err := crypto.DecryptJSON(listenerInfo.EncryptionKey, resp.Payload, resp.Nonce, resp.Timestamp, &payloadDown); err != nil {
-			return err
+			proxyMgr.MarkFailed(pollCtx, proxyURL)
+			return stable, err
 		}
 		if err := processPollResponse(pollCtx, cfg, rdb, dispatcher, &payloadDown); err != nil {
-			return err
+			proxyMgr.MarkFailed(pollCtx, proxyURL)
+			return stable, err
 		}
 
 		slog.InfoContext(pollCtx, "websocket sync completed",
 			"new_requests", len(payloadDown.Requests),
+			"chunked_requests", len(payloadDown.RequestChunks),
 			"acked_results", len(payloadDown.AckResultIDs),
 			"results_sent", len(leasedResults),
 			"known_request_states", len(payloadUp.RequestStates),
+			"chunk_receipts", len(payloadUp.ChunkReceipts),
 		)
+		stable = true
 
 		if dispatcher.InFlight() > 0 {
 			if !sleepWithCancel(ctx, sigCh, activeWorkPollInterval) {
-				return nil
+				_ = writeWebSocketClose(conn, cfg, websocket.CloseNormalClosure, "dispatcher idle exit")
+				return true, nil
 			}
 		}
 	}
 }
 
-func websocketDialerForProxy(proxyURL string, requestTimeout int) (*websocket.Dialer, error) {
-	dialer := websocket.Dialer{
-		HandshakeTimeout: time.Duration(requestTimeout+15) * time.Second,
-	}
+func setWebSocketReadDeadline(conn *websocket.Conn, cfg *config.Config) error {
+	return conn.SetReadDeadline(time.Now().Add(cfg.WSIdleTimeoutDuration()))
+}
 
-	if proxyURL == "" || proxyURL == "direct" {
-		return &dialer, nil
-	}
+func writeWebSocketClose(conn *websocket.Conn, cfg *config.Config, code int, reason string) error {
+	return conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(cfg.WSWriteTimeoutDuration()))
+}
 
-	parsed, err := url.Parse(proxyURL)
-	if err != nil {
-		return nil, err
+func classifyRuntimeWebSocketError(err error) string {
+	if err == nil {
+		return ""
 	}
-
-	switch parsed.Scheme {
-	case "http", "https":
-		dialer.Proxy = http.ProxyURL(parsed)
-		dialer.NetDialContext = (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext
-	case "socks5", "socks5h":
-		var auth *xproxy.Auth
-		if parsed.User != nil {
-			auth = &xproxy.Auth{User: parsed.User.Username()}
-			auth.Password, _ = parsed.User.Password()
-		}
-		base, err := xproxy.SOCKS5("tcp", parsed.Host, auth, xproxy.Direct)
-		if err != nil {
-			return nil, err
-		}
-		ctxDialer, ok := base.(xproxy.ContextDialer)
-		if !ok {
-			return nil, fmt.Errorf("SOCKS5 dialer does not support context")
-		}
-		dialer.NetDialContext = ctxDialer.DialContext
-	default:
-		return nil, fmt.Errorf("unsupported proxy scheme: %s", parsed.Scheme)
+	if closeErr, ok := err.(*websocket.CloseError); ok {
+		return fmt.Sprintf("close:%d:%s", closeErr.Code, closeErr.Text)
 	}
-
-	return &dialer, nil
+	if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+		return "idle-timeout"
+	}
+	return err.Error()
 }

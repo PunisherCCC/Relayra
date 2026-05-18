@@ -240,9 +240,14 @@ func buildPayloadUp(ctx context.Context, cfg *config.Config, rdb store.Backend) 
 	if err != nil {
 		return nil, nil, err
 	}
+	chunkReceipts, err := rdb.ListChunkReceipts(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	return &models.PollPayloadUp{
 		Results:       results,
 		RequestStates: requestStates,
+		ChunkReceipts: chunkReceipts,
 	}, results, nil
 }
 
@@ -250,6 +255,18 @@ func processPollResponse(ctx context.Context, cfg *config.Config, rdb store.Back
 	if len(payloadDown.AckResultIDs) > 0 {
 		if err := rdb.AckResults(ctx, payloadDown.AckResultIDs); err != nil {
 			return err
+		}
+	}
+
+	for _, chunk := range payloadDown.RequestChunks {
+		_, req, err := rdb.StoreInboundChunk(ctx, chunk, senderRequestLeaseDuration(cfg))
+		if err != nil {
+			return err
+		}
+		if req != nil {
+			if err := handleIncomingRequest(ctx, cfg, rdb, dispatcher, *req); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -339,7 +356,12 @@ func pollRequestTimeout(cfg *config.Config, longPoll bool) time.Duration {
 }
 
 func senderRequestLeaseDuration(cfg *config.Config) time.Duration {
-	seconds := cfg.RequestTimeout + cfg.LongPollWait + cfg.PollInterval + 30
+	seconds := cfg.RequestTimeout + cfg.PollInterval + 30
+	if cfg.NormalizedTransportMode() == config.TransportModeWebSocket {
+		seconds += cfg.WSIdleTimeout + cfg.WSReconnectMaxSeconds
+	} else {
+		seconds += cfg.LongPollWait
+	}
 	if seconds < cfg.RequestTimeout+30 {
 		seconds = cfg.RequestTimeout + 30
 	}
@@ -347,7 +369,12 @@ func senderRequestLeaseDuration(cfg *config.Config) time.Duration {
 }
 
 func senderResultLeaseDuration(cfg *config.Config) time.Duration {
-	seconds := cfg.RequestTimeout + cfg.LongPollWait + cfg.PollInterval + 30
+	seconds := cfg.RequestTimeout + cfg.PollInterval + 30
+	if cfg.NormalizedTransportMode() == config.TransportModeWebSocket {
+		seconds += cfg.WSIdleTimeout + cfg.WSReconnectMaxSeconds
+	} else {
+		seconds += cfg.LongPollWait
+	}
 	if seconds < cfg.RequestTimeout+30 {
 		seconds = cfg.RequestTimeout + 30
 	}

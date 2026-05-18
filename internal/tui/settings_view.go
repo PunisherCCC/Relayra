@@ -42,6 +42,12 @@ var editableKeys = map[string]bool{
 	"transport_mode":           true,
 	"long_poll_wait":           true,
 	"proxy_cooldown_seconds":   true,
+	"transport_chunk_size":     true,
+	"ws_ping_interval":         true,
+	"ws_write_timeout":         true,
+	"ws_idle_timeout":          true,
+	"ws_reconnect_base":        true,
+	"ws_reconnect_max":         true,
 	"async_workers":            true,
 	"allow_listener_execution": true,
 	"result_ttl":               true,
@@ -78,6 +84,12 @@ func NewSettingsView(cfg *config.Config, rdb store.Backend) *SettingsView {
 		{"Transport Mode", cfg.NormalizedTransportMode(), "transport_mode"},
 		{"Long Poll Wait", fmt.Sprintf("%d", cfg.LongPollWait), "long_poll_wait"},
 		{"Proxy Cooldown Seconds", fmt.Sprintf("%d", cfg.ProxyCooldownSeconds), "proxy_cooldown_seconds"},
+		{"Transport Chunk Size", fmt.Sprintf("%d", cfg.TransportChunkSizeBytes), "transport_chunk_size"},
+		{"WS Ping Interval", fmt.Sprintf("%d", cfg.WSPingInterval), "ws_ping_interval"},
+		{"WS Write Timeout", fmt.Sprintf("%d", cfg.WSWriteTimeout), "ws_write_timeout"},
+		{"WS Idle Timeout", fmt.Sprintf("%d", cfg.WSIdleTimeout), "ws_idle_timeout"},
+		{"WS Reconnect Base", fmt.Sprintf("%d", cfg.WSReconnectBaseSeconds), "ws_reconnect_base"},
+		{"WS Reconnect Max", fmt.Sprintf("%d", cfg.WSReconnectMaxSeconds), "ws_reconnect_max"},
 		{"Async Workers", fmt.Sprintf("%d", cfg.AsyncWorkers), "async_workers"},
 		{"Allow Listener Execution", fmt.Sprintf("%t", cfg.AllowListenerExecution), "allow_listener_execution"},
 		{"Result TTL", fmt.Sprintf("%d", cfg.ResultTTL), "result_ttl"},
@@ -228,6 +240,36 @@ func (sv *SettingsView) applyEdit() tea.Cmd {
 		case "proxy_cooldown_seconds":
 			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {
 				sv.cfg.ProxyCooldownSeconds = v
+				sv.items[sv.cursor].Value = newVal
+			}
+		case "transport_chunk_size":
+			if v, err := strconv.Atoi(newVal); err == nil && v >= 1024 {
+				sv.cfg.TransportChunkSizeBytes = v
+				sv.items[sv.cursor].Value = newVal
+			}
+		case "ws_ping_interval":
+			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {
+				sv.cfg.WSPingInterval = v
+				sv.items[sv.cursor].Value = newVal
+			}
+		case "ws_write_timeout":
+			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {
+				sv.cfg.WSWriteTimeout = v
+				sv.items[sv.cursor].Value = newVal
+			}
+		case "ws_idle_timeout":
+			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {
+				sv.cfg.WSIdleTimeout = v
+				sv.items[sv.cursor].Value = newVal
+			}
+		case "ws_reconnect_base":
+			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {
+				sv.cfg.WSReconnectBaseSeconds = v
+				sv.items[sv.cursor].Value = newVal
+			}
+		case "ws_reconnect_max":
+			if v, err := strconv.Atoi(newVal); err == nil && v >= sv.cfg.WSReconnectBaseSeconds {
+				sv.cfg.WSReconnectMaxSeconds = v
 				sv.items[sv.cursor].Value = newVal
 			}
 		case "async_workers":

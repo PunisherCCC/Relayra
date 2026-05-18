@@ -21,10 +21,14 @@ type PollResponse struct {
 type PollPayloadUp struct {
 	Results       []RelayResult      `json:"results,omitempty"`
 	RequestStates []RequestSyncState `json:"request_states,omitempty"`
+	ChunkReceipts []ChunkReceipt     `json:"chunk_receipts,omitempty"`
+	Probe         *ProbeMessage      `json:"probe,omitempty"`
 }
 
 // PollPayloadDown is the decrypted payload sent by the Listener.
 type PollPayloadDown struct {
-	Requests     []RelayRequest `json:"requests,omitempty"`
-	AckResultIDs []string       `json:"ack_result_ids,omitempty"`
+	Requests      []RelayRequest   `json:"requests,omitempty"`
+	RequestChunks []TransportChunk `json:"request_chunks,omitempty"`
+	AckResultIDs  []string         `json:"ack_result_ids,omitempty"`
+	Probe         *ProbeMessage    `json:"probe,omitempty"`
 }

@@ -14,6 +14,7 @@ import (
 
 // ProxyDetailView shows details of a single proxy with management options.
 type ProxyDetailView struct {
+	cfg       *config.Config
 	manager   *proxy.Manager
 	rdb       store.Backend
 	proxyURL  string
@@ -25,9 +26,8 @@ type ProxyDetailView struct {
 	confirm   bool
 	deleted   bool
 
-	// Editing state
 	editing    bool
-	editField  int // 0=scheme+host, 1=username, 2=password
+	editField  int
 	editFields []editableField
 	testResult string
 	testing    bool
@@ -52,7 +52,8 @@ type proxyCooldownResetMsg struct {
 }
 
 type proxyTestResultMsg struct {
-	err error
+	result string
+	err    error
 }
 
 type proxyUpdatedMsg struct {
@@ -65,12 +66,14 @@ func NewProxyDetailView(cfg *config.Config, rdb store.Backend, proxyURL string) 
 	mgr := proxy.NewManager(rdb, cfg.ProxyCooldown())
 
 	pd := &ProxyDetailView{
+		cfg:      cfg,
 		manager:  mgr,
 		rdb:      rdb,
 		proxyURL: proxyURL,
 		actions: []string{
 			"Edit URL",
 			"Test Proxy",
+			"Test WebSocket Reliability",
 			"Reset Cooldown",
 			"Delete Proxy",
 			"Back",
@@ -179,7 +182,7 @@ func (pd *ProxyDetailView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			pd.testResult = fmt.Sprintf("FAILED: %v", msg.err)
 		} else {
-			pd.testResult = "OK — proxy is working"
+			pd.testResult = msg.result
 		}
 		return pd, pd.loadProxy
 
@@ -225,6 +228,7 @@ func (pd *ProxyDetailView) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return pd.executeAction()
 		}
 	}
+
 	return pd, nil
 }
 
@@ -236,10 +240,9 @@ func (pd *ProxyDetailView) updateEditing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		pd.editField = (pd.editField - 1 + len(pd.editFields)) % len(pd.editFields)
 	case "esc":
 		pd.editing = false
-		pd.parseURLFields() // revert
+		pd.parseURLFields()
 		return pd, nil
 	case "enter":
-		// Save
 		newURL := pd.buildURL()
 		if newURL == pd.proxyURL {
 			pd.editing = false
@@ -259,6 +262,7 @@ func (pd *ProxyDetailView) updateEditing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			pd.editFields[pd.editField].Value += msg.String()
 		}
 	}
+
 	return pd, nil
 }
 
@@ -273,7 +277,36 @@ func (pd *ProxyDetailView) executeAction() (tea.Model, tea.Cmd) {
 		pd.testResult = ""
 		return pd, func() tea.Msg {
 			err := pd.manager.Test(context.Background(), pd.proxyURL)
-			return proxyTestResultMsg{err: err}
+			return proxyTestResultMsg{result: "OK - proxy is working", err: err}
+		}
+	case "Test WebSocket Reliability":
+		pd.testing = true
+		pd.testResult = ""
+		return pd, func() tea.Msg {
+			listener, err := pd.rdb.GetListenerInfo(context.Background())
+			if err != nil {
+				return proxyTestResultMsg{err: err}
+			}
+			if listener == nil {
+				return proxyTestResultMsg{err: fmt.Errorf("no paired listener found")}
+			}
+
+			result, err := proxy.TestWebSocketReliability(context.Background(), pd.cfg, listener, pd.proxyURL, 3, 30, 5)
+			if err != nil {
+				return proxyTestResultMsg{err: err}
+			}
+
+			var b strings.Builder
+			b.WriteString(fmt.Sprintf("WebSocket %d/100 (%s)", result.Score, result.Grade))
+			for _, sample := range result.Samples {
+				reason := sample.DisconnectReason
+				if reason == "" {
+					reason = "completed"
+				}
+				b.WriteString(fmt.Sprintf("\n  sample %d: %.1fs %d/%d ack score=%d %s",
+					sample.Sample, sample.AliveDuration.Seconds(), sample.ProbesAcked, sample.ProbesSent, sample.Score, reason))
+			}
+			return proxyTestResultMsg{result: b.String()}
 		}
 	case "Reset Cooldown":
 		return pd, func() tea.Msg {
@@ -283,8 +316,8 @@ func (pd *ProxyDetailView) executeAction() (tea.Model, tea.Cmd) {
 	case "Delete Proxy":
 		pd.confirm = true
 	case "Back":
-		// handled by parent
 	}
+
 	return pd, nil
 }
 
@@ -317,7 +350,6 @@ func (pd *ProxyDetailView) View() string {
 		return pd.viewEditing()
 	}
 
-	// Proxy info
 	parsed, _ := url.Parse(pd.proxyURL)
 	displayHost := pd.proxyURL
 	username := ""
@@ -331,7 +363,7 @@ func (pd *ProxyDetailView) View() string {
 	b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("URL:"), valueStyle.Render(displayHost)))
 	if username != "" {
 		b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("Username:"), valueStyle.Render(username)))
-		masked := strings.Repeat("•", len(password))
+		masked := strings.Repeat("*", len(password))
 		if password == "" {
 			masked = "(none)"
 		}
@@ -374,12 +406,11 @@ func (pd *ProxyDetailView) View() string {
 		return b.String()
 	}
 
-	// Actions
 	for i, action := range pd.actions {
 		cursor := "  "
 		style := normalStyle
 		if i == pd.actionIdx {
-			cursor = "▸ "
+			cursor = "> "
 			style = selectedStyle
 		}
 		b.WriteString(style.Render(cursor + action))
@@ -387,7 +418,7 @@ func (pd *ProxyDetailView) View() string {
 	}
 
 	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("  ↑/↓ navigate • enter select • esc back"))
+	b.WriteString(dimStyle.Render("  up/down navigate • enter select • esc back"))
 
 	return b.String()
 }
@@ -402,19 +433,19 @@ func (pd *ProxyDetailView) viewEditing() string {
 		cursor := "  "
 		style := dimStyle
 		if i == pd.editField {
-			cursor = "▸ "
+			cursor = "> "
 			style = selectedStyle
 		}
 
 		displayValue := field.Value
 		if field.Label == "Password" && len(displayValue) > 0 && i != pd.editField {
-			displayValue = strings.Repeat("•", len(displayValue))
+			displayValue = strings.Repeat("*", len(displayValue))
 		}
 
 		b.WriteString(fmt.Sprintf("%s%s %s\n",
 			cursor,
 			labelStyle.Render(field.Label+":"),
-			style.Render(displayValue+"█"),
+			style.Render(displayValue+"|"),
 		))
 	}
 

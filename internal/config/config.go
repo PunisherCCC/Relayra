@@ -22,8 +22,8 @@ const (
 )
 
 const (
-	TransportModeInterval = "interval"
-	TransportModeLongPoll = "long-poll"
+	TransportModeInterval  = "interval"
+	TransportModeLongPoll  = "long-poll"
 	TransportModeWebSocket = "websocket"
 )
 
@@ -52,14 +52,20 @@ type Config struct {
 	RedisDB       int    `env:"RELAYRA_REDIS_DB"`
 
 	// Polling (Sender)
-	PollInterval          int    `env:"RELAYRA_POLL_INTERVAL"`
-	PollBatchSize         int    `env:"RELAYRA_POLL_BATCH_SIZE"`
-	RequestTimeout        int    `env:"RELAYRA_REQUEST_TIMEOUT"`
-	LongPolling           bool   `env:"RELAYRA_LONG_POLLING"`
-	LongPollWait          int    `env:"RELAYRA_LONG_POLL_WAIT"`
-	AsyncWorkers          int    `env:"RELAYRA_ASYNC_WORKERS"`
-	TransportMode         string `env:"RELAYRA_TRANSPORT_MODE"`
-	ProxyCooldownSeconds  int    `env:"RELAYRA_PROXY_COOLDOWN_SECONDS"`
+	PollInterval            int    `env:"RELAYRA_POLL_INTERVAL"`
+	PollBatchSize           int    `env:"RELAYRA_POLL_BATCH_SIZE"`
+	RequestTimeout          int    `env:"RELAYRA_REQUEST_TIMEOUT"`
+	LongPolling             bool   `env:"RELAYRA_LONG_POLLING"`
+	LongPollWait            int    `env:"RELAYRA_LONG_POLL_WAIT"`
+	AsyncWorkers            int    `env:"RELAYRA_ASYNC_WORKERS"`
+	TransportMode           string `env:"RELAYRA_TRANSPORT_MODE"`
+	ProxyCooldownSeconds    int    `env:"RELAYRA_PROXY_COOLDOWN_SECONDS"`
+	TransportChunkSizeBytes int    `env:"RELAYRA_TRANSPORT_CHUNK_SIZE_BYTES"`
+	WSPingInterval          int    `env:"RELAYRA_WS_PING_INTERVAL"`
+	WSWriteTimeout          int    `env:"RELAYRA_WS_WRITE_TIMEOUT"`
+	WSIdleTimeout           int    `env:"RELAYRA_WS_IDLE_TIMEOUT"`
+	WSReconnectBaseSeconds  int    `env:"RELAYRA_WS_RECONNECT_BASE_SECONDS"`
+	WSReconnectMaxSeconds   int    `env:"RELAYRA_WS_RECONNECT_MAX_SECONDS"`
 
 	// Execution
 	AllowListenerExecution bool `env:"RELAYRA_ALLOW_LISTENER_EXECUTION"`
@@ -77,28 +83,34 @@ type Config struct {
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		ListenAddr:             "0.0.0.0",
-		ListenPort:             10000 + rand.Intn(55535),
-		StorageBackend:         "redis",
-		SQLitePath:             defaultSQLitePath(),
-		RedisAddr:              "127.0.0.1",
-		RedisPort:              6379,
-		RedisPassword:          "",
-		RedisDB:                0,
-		PollInterval:           5,
-		PollBatchSize:          10,
-		RequestTimeout:         30,
-		LongPolling:            true,
-		LongPollWait:           30,
-		AsyncWorkers:           4,
-		TransportMode:          TransportModeLongPoll,
-		ProxyCooldownSeconds:   300,
-		AllowListenerExecution: false,
-		LogLevel:               "info",
-		LogDir:                 "/opt/relayra/logs",
-		LogMaxDays:             7,
-		ResultTTL:              86400,
-		WebhookMaxRetries:      3,
+		ListenAddr:              "0.0.0.0",
+		ListenPort:              10000 + rand.Intn(55535),
+		StorageBackend:          "redis",
+		SQLitePath:              defaultSQLitePath(),
+		RedisAddr:               "127.0.0.1",
+		RedisPort:               6379,
+		RedisPassword:           "",
+		RedisDB:                 0,
+		PollInterval:            5,
+		PollBatchSize:           10,
+		RequestTimeout:          30,
+		LongPolling:             true,
+		LongPollWait:            30,
+		AsyncWorkers:            4,
+		TransportMode:           TransportModeLongPoll,
+		ProxyCooldownSeconds:    300,
+		TransportChunkSizeBytes: 262144,
+		WSPingInterval:          20,
+		WSWriteTimeout:          15,
+		WSIdleTimeout:           60,
+		WSReconnectBaseSeconds:  1,
+		WSReconnectMaxSeconds:   30,
+		AllowListenerExecution:  false,
+		LogLevel:                "info",
+		LogDir:                  "/opt/relayra/logs",
+		LogMaxDays:              7,
+		ResultTTL:               86400,
+		WebhookMaxRetries:       3,
 	}
 }
 
@@ -155,6 +167,12 @@ func Load() (*Config, error) {
 		}
 	}
 	cfg.ProxyCooldownSeconds = getEnvInt("RELAYRA_PROXY_COOLDOWN_SECONDS", cfg.ProxyCooldownSeconds)
+	cfg.TransportChunkSizeBytes = getEnvInt("RELAYRA_TRANSPORT_CHUNK_SIZE_BYTES", cfg.TransportChunkSizeBytes)
+	cfg.WSPingInterval = getEnvInt("RELAYRA_WS_PING_INTERVAL", cfg.WSPingInterval)
+	cfg.WSWriteTimeout = getEnvInt("RELAYRA_WS_WRITE_TIMEOUT", cfg.WSWriteTimeout)
+	cfg.WSIdleTimeout = getEnvInt("RELAYRA_WS_IDLE_TIMEOUT", cfg.WSIdleTimeout)
+	cfg.WSReconnectBaseSeconds = getEnvInt("RELAYRA_WS_RECONNECT_BASE_SECONDS", cfg.WSReconnectBaseSeconds)
+	cfg.WSReconnectMaxSeconds = getEnvInt("RELAYRA_WS_RECONNECT_MAX_SECONDS", cfg.WSReconnectMaxSeconds)
 	cfg.AllowListenerExecution = getEnvBool("RELAYRA_ALLOW_LISTENER_EXECUTION", cfg.AllowListenerExecution)
 	cfg.LogLevel = getEnvStr("RELAYRA_LOG_LEVEL", cfg.LogLevel)
 	cfg.LogDir = getEnvStr("RELAYRA_LOG_DIR", cfg.LogDir)
@@ -211,6 +229,12 @@ func Save(cfg *Config) error {
 		fmt.Sprintf("RELAYRA_LONG_POLL_WAIT=%d", cfg.LongPollWait),
 		fmt.Sprintf("RELAYRA_ASYNC_WORKERS=%d", cfg.AsyncWorkers),
 		fmt.Sprintf("RELAYRA_PROXY_COOLDOWN_SECONDS=%d", cfg.ProxyCooldownSeconds),
+		fmt.Sprintf("RELAYRA_TRANSPORT_CHUNK_SIZE_BYTES=%d", cfg.TransportChunkSizeBytes),
+		fmt.Sprintf("RELAYRA_WS_PING_INTERVAL=%d", cfg.WSPingInterval),
+		fmt.Sprintf("RELAYRA_WS_WRITE_TIMEOUT=%d", cfg.WSWriteTimeout),
+		fmt.Sprintf("RELAYRA_WS_IDLE_TIMEOUT=%d", cfg.WSIdleTimeout),
+		fmt.Sprintf("RELAYRA_WS_RECONNECT_BASE_SECONDS=%d", cfg.WSReconnectBaseSeconds),
+		fmt.Sprintf("RELAYRA_WS_RECONNECT_MAX_SECONDS=%d", cfg.WSReconnectMaxSeconds),
 		"",
 		"# Execution",
 		fmt.Sprintf("RELAYRA_ALLOW_LISTENER_EXECUTION=%t", cfg.AllowListenerExecution),
@@ -280,6 +304,24 @@ func (c *Config) Validate() error {
 	}
 	if c.ProxyCooldownSeconds < 1 {
 		return fmt.Errorf("RELAYRA_PROXY_COOLDOWN_SECONDS must be >= 1 second, got %d", c.ProxyCooldownSeconds)
+	}
+	if c.TransportChunkSizeBytes < 1024 {
+		return fmt.Errorf("RELAYRA_TRANSPORT_CHUNK_SIZE_BYTES must be >= 1024, got %d", c.TransportChunkSizeBytes)
+	}
+	if c.WSPingInterval < 1 {
+		return fmt.Errorf("RELAYRA_WS_PING_INTERVAL must be >= 1 second, got %d", c.WSPingInterval)
+	}
+	if c.WSWriteTimeout < 1 {
+		return fmt.Errorf("RELAYRA_WS_WRITE_TIMEOUT must be >= 1 second, got %d", c.WSWriteTimeout)
+	}
+	if c.WSIdleTimeout < 1 {
+		return fmt.Errorf("RELAYRA_WS_IDLE_TIMEOUT must be >= 1 second, got %d", c.WSIdleTimeout)
+	}
+	if c.WSReconnectBaseSeconds < 1 {
+		return fmt.Errorf("RELAYRA_WS_RECONNECT_BASE_SECONDS must be >= 1 second, got %d", c.WSReconnectBaseSeconds)
+	}
+	if c.WSReconnectMaxSeconds < c.WSReconnectBaseSeconds {
+		return fmt.Errorf("RELAYRA_WS_RECONNECT_MAX_SECONDS must be >= RELAYRA_WS_RECONNECT_BASE_SECONDS")
 	}
 	if c.ResultTTL < 1 {
 		return fmt.Errorf("RELAYRA_RESULT_TTL must be >= 1 second, got %d", c.ResultTTL)
@@ -357,6 +399,36 @@ func (c *Config) NormalizedTransportMode() string {
 // ProxyCooldown returns the configured proxy cooldown as a duration.
 func (c *Config) ProxyCooldown() time.Duration {
 	return time.Duration(c.ProxyCooldownSeconds) * time.Second
+}
+
+// TransportChunkSize returns the configured chunk size in bytes.
+func (c *Config) TransportChunkSize() int {
+	return c.TransportChunkSizeBytes
+}
+
+// WSPingIntervalDuration returns the websocket ping cadence.
+func (c *Config) WSPingIntervalDuration() time.Duration {
+	return time.Duration(c.WSPingInterval) * time.Second
+}
+
+// WSWriteTimeoutDuration returns the websocket write timeout.
+func (c *Config) WSWriteTimeoutDuration() time.Duration {
+	return time.Duration(c.WSWriteTimeout) * time.Second
+}
+
+// WSIdleTimeoutDuration returns the websocket read idle timeout.
+func (c *Config) WSIdleTimeoutDuration() time.Duration {
+	return time.Duration(c.WSIdleTimeout) * time.Second
+}
+
+// WSReconnectBaseDuration returns the initial websocket reconnect backoff.
+func (c *Config) WSReconnectBaseDuration() time.Duration {
+	return time.Duration(c.WSReconnectBaseSeconds) * time.Second
+}
+
+// WSReconnectMaxDuration returns the maximum websocket reconnect backoff.
+func (c *Config) WSReconnectMaxDuration() time.Duration {
+	return time.Duration(c.WSReconnectMaxSeconds) * time.Second
 }
 
 // Capabilities reports the current instance feature support for pairing and visibility.

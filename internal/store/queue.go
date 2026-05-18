@@ -30,13 +30,13 @@ func (r *Redis) StoreRequestMetadata(ctx context.Context, peerID string, req *mo
 
 	reqKey := keyRequestPrefix + req.ID
 	if err := r.Client.HSet(ctx, reqKey, map[string]interface{}{
-		"id":                 req.ID,
-		"peer_id":            peerID,
-		"webhook_url":        req.WebhookURL,
-		"status":             string(req.Status),
-		"created_at":         req.CreatedAt.Unix(),
-		"data":               string(data),
-		"async":              req.Async,
+		"id":                   req.ID,
+		"peer_id":              peerID,
+		"webhook_url":          req.WebhookURL,
+		"status":               string(req.Status),
+		"created_at":           req.CreatedAt.Unix(),
+		"data":                 string(data),
+		"async":                req.Async,
 		requestLeaseUntilField: 0,
 	}).Err(); err != nil {
 		slog.ErrorContext(ctx, "failed to store request metadata", "error", err)
@@ -63,13 +63,13 @@ func (r *Redis) EnqueueRequest(ctx context.Context, peerID string, req *models.R
 
 	pipe.RPush(ctx, queueKey, req.ID)
 	pipe.HSet(ctx, reqKey, map[string]interface{}{
-		"id":                 req.ID,
-		"peer_id":            peerID,
-		"webhook_url":        req.WebhookURL,
-		"status":             string(models.StatusQueued),
-		"created_at":         req.CreatedAt.Unix(),
-		"data":               string(data),
-		"async":              req.Async,
+		"id":                   req.ID,
+		"peer_id":              peerID,
+		"webhook_url":          req.WebhookURL,
+		"status":               string(models.StatusQueued),
+		"created_at":           req.CreatedAt.Unix(),
+		"data":                 string(data),
+		"async":                req.Async,
 		requestLeaseUntilField: 0,
 	})
 
@@ -85,6 +85,43 @@ func (r *Redis) EnqueueRequest(ctx context.Context, peerID string, req *models.R
 // DequeueRequests is kept as a compatibility wrapper around LeaseRequests.
 func (r *Redis) DequeueRequests(ctx context.Context, peerID string, batchSize int) ([]models.RelayRequest, error) {
 	return r.LeaseRequests(ctx, peerID, batchSize, 30*time.Second)
+}
+
+// ClearPeerQueue removes queued-only requests for a peer without touching leased work.
+func (r *Redis) ClearPeerQueue(ctx context.Context, peerID string) (int64, error) {
+	queueKey := keyQueuePrefix + peerID
+	ids, err := r.Client.LRange(ctx, queueKey, 0, -1).Result()
+	if err != nil {
+		return 0, fmt.Errorf("list queue for clear: %w", err)
+	}
+
+	var cleared int64
+	for _, id := range ids {
+		reqKey := keyRequestPrefix + id
+		values, err := r.Client.HMGet(ctx, reqKey, "status").Result()
+		if err != nil {
+			return cleared, fmt.Errorf("lookup queued request %s: %w", id, err)
+		}
+		if len(values) != 1 || values[0] == nil {
+			continue
+		}
+
+		status, _ := values[0].(string)
+		if models.RequestStatus(status) != models.StatusQueued {
+			continue
+		}
+
+		pipe := r.Client.Pipeline()
+		pipe.LRem(ctx, queueKey, 0, id)
+		pipe.HSet(ctx, reqKey, "status", string(models.StatusFailed))
+		pipe.Del(ctx, keyChunkCursorPrefix+models.RequestTransferID(id))
+		if _, err := pipe.Exec(ctx); err != nil {
+			return cleared, fmt.Errorf("clear queued request %s: %w", id, err)
+		}
+		cleared++
+	}
+
+	return cleared, nil
 }
 
 // QueueLength returns the number of pending requests for a peer.

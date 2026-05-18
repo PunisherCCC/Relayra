@@ -18,6 +18,7 @@ import (
 	"github.com/relayra/relayra/internal/models"
 	"github.com/relayra/relayra/internal/relayexec"
 	"github.com/relayra/relayra/internal/store"
+	"github.com/relayra/relayra/internal/transport"
 	"github.com/relayra/relayra/internal/webhook"
 )
 
@@ -371,7 +372,13 @@ func (h *Handlers) waitForQueuedRequests(ctx context.Context, peerID string, tim
 }
 
 func (h *Handlers) requestLeaseDuration() time.Duration {
-	seconds := h.cfg.RequestTimeout + h.cfg.LongPollWait + h.cfg.PollInterval + 30
+	seconds := h.cfg.RequestTimeout + h.cfg.PollInterval + 30
+	wsWindow := h.cfg.WSIdleTimeout + h.cfg.WSReconnectMaxSeconds
+	if wsWindow > h.cfg.LongPollWait {
+		seconds += wsWindow
+	} else {
+		seconds += h.cfg.LongPollWait
+	}
 	if seconds < h.cfg.RequestTimeout+30 {
 		seconds = h.cfg.RequestTimeout + 30
 	}
@@ -416,6 +423,21 @@ func (h *Handlers) handlePollMessage(ctx context.Context, peerID, payload, nonce
 }
 
 func (h *Handlers) processPollPayload(ctx context.Context, peerID string, payloadUp *models.PollPayloadUp, waitSeconds int) (*models.PollPayloadDown, error) {
+	if len(payloadUp.ChunkReceipts) > 0 {
+		for _, receipt := range payloadUp.ChunkReceipts {
+			if err := h.rdb.ApplyChunkReceipt(ctx, receipt); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	probeResp := h.buildProbeAck(payloadUp)
+	probeOnly := payloadUp.Probe != nil && payloadUp.Probe.ProbeOnly &&
+		len(payloadUp.Results) == 0 && len(payloadUp.RequestStates) == 0 && len(payloadUp.ChunkReceipts) == 0
+	if probeOnly {
+		return &models.PollPayloadDown{Probe: probeResp}, nil
+	}
+
 	if len(payloadUp.RequestStates) > 0 {
 		if err := h.rdb.ApplyRequestStates(ctx, payloadUp.RequestStates); err != nil {
 			return nil, err
@@ -448,13 +470,108 @@ func (h *Handlers) processPollPayload(ctx context.Context, peerID string, payloa
 		h.waitForQueuedRequests(ctx, peerID, time.Duration(waitSeconds)*time.Second)
 	}
 
-	requests, err := h.rdb.LeaseRequests(ctx, peerID, h.cfg.PollBatchSize, h.requestLeaseDuration())
+	requests, chunks, err := h.nextOutboundPayload(ctx, peerID)
 	if err != nil {
 		return nil, err
 	}
 
 	return &models.PollPayloadDown{
-		Requests:     requests,
-		AckResultIDs: ackResultIDs,
+		Requests:      requests,
+		RequestChunks: chunks,
+		AckResultIDs:  ackResultIDs,
+		Probe:         probeResp,
 	}, nil
+}
+
+func (h *Handlers) buildProbeAck(payloadUp *models.PollPayloadUp) *models.ProbeMessage {
+	if payloadUp == nil || payloadUp.Probe == nil {
+		return nil
+	}
+	return &models.ProbeMessage{
+		ID:        payloadUp.Probe.ID,
+		Sequence:  payloadUp.Probe.Sequence,
+		SentAt:    payloadUp.Probe.SentAt,
+		Ack:       true,
+		ProbeOnly: payloadUp.Probe.ProbeOnly,
+	}
+}
+
+func (h *Handlers) nextOutboundPayload(ctx context.Context, peerID string) ([]models.RelayRequest, []models.TransportChunk, error) {
+	remaining := h.cfg.PollBatchSize
+	requests := make([]models.RelayRequest, 0, remaining)
+	chunks := make([]models.TransportChunk, 0, remaining)
+
+	appendPayload := func(req models.RelayRequest) error {
+		if remaining < 1 {
+			return nil
+		}
+
+		needsChunking, _, err := transport.RequestNeedsChunking(req, h.cfg.TransportChunkSize())
+		if err != nil {
+			return err
+		}
+		if !needsChunking {
+			requests = append(requests, req)
+			remaining--
+			return nil
+		}
+
+		cursor, err := h.rdb.GetChunkCursor(ctx, models.RequestTransferID(req.ID))
+		if err != nil {
+			return err
+		}
+		nextIndex := 0
+		if cursor != nil {
+			nextIndex = cursor.NextIndex
+		}
+		chunk, err := transport.RequestChunkAt(req, h.cfg.TransportChunkSize(), nextIndex)
+		if err != nil {
+			if strings.Contains(err.Error(), "out of range") {
+				return nil
+			}
+			return err
+		}
+		chunks = append(chunks, *chunk)
+		remaining--
+		return nil
+	}
+
+	active, err := h.rdb.ListActiveLeasedRequests(ctx, peerID, h.cfg.PollBatchSize)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, req := range active {
+		if remaining < 1 {
+			break
+		}
+		needsChunking, _, err := transport.RequestNeedsChunking(req, h.cfg.TransportChunkSize())
+		if err != nil {
+			return nil, nil, err
+		}
+		if !needsChunking {
+			continue
+		}
+		if err := appendPayload(req); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if remaining < 1 {
+		return requests, chunks, nil
+	}
+
+	leased, err := h.rdb.LeaseRequests(ctx, peerID, remaining, h.requestLeaseDuration())
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, req := range leased {
+		if remaining < 1 {
+			break
+		}
+		if err := appendPayload(req); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return requests, chunks, nil
 }

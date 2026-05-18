@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -149,5 +151,137 @@ func TestSQLiteLeaseResultsUntilAck(t *testing.T) {
 	}
 	if state != nil {
 		t.Fatalf("GetSenderRequestState() = %+v, want nil after ack cleanup", state)
+	}
+}
+
+func TestSQLiteStoreInboundChunkReassemblesRequest(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+
+	req := models.RelayRequest{
+		ID: "req-chunked",
+		Request: models.HTTPRequest{
+			URL:    "http://127.0.0.1:8080/large",
+			Method: "POST",
+			Body:   string(make([]byte, 300000)),
+		},
+		Status:    models.StatusQueued,
+		CreatedAt: time.Now(),
+	}
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	chunkSize := 131072
+	total := (len(payload) + chunkSize - 1) / chunkSize
+	checksum := models.SHA256Hex(payload)
+
+	var reassembled *models.RelayRequest
+	for i := 0; i < total; i++ {
+		start := i * chunkSize
+		end := start + chunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		receipt, assembled, err := s.StoreInboundChunk(ctx, models.TransportChunk{
+			TransferID: models.RequestTransferID(req.ID),
+			RequestID:  req.ID,
+			Kind:       models.TransportChunkKindRequest,
+			Index:      i,
+			Total:      total,
+			Payload:    base64.StdEncoding.EncodeToString(payload[start:end]),
+			Checksum:   checksum,
+			TotalSize:  len(payload),
+		}, time.Minute)
+		if err != nil {
+			t.Fatalf("StoreInboundChunk() error = %v", err)
+		}
+		if receipt == nil {
+			t.Fatalf("StoreInboundChunk() receipt = nil")
+		}
+		if i < total-1 && assembled != nil {
+			t.Fatalf("StoreInboundChunk() assembled request too early at chunk %d", i)
+		}
+		if assembled != nil {
+			reassembled = assembled
+		}
+	}
+
+	if reassembled == nil {
+		t.Fatalf("reassembled request = nil")
+	}
+	if reassembled.ID != req.ID || reassembled.Request.URL != req.Request.URL || reassembled.Request.Method != req.Request.Method {
+		t.Fatalf("reassembled request = %+v, want %+v", reassembled, req)
+	}
+
+	receipts, err := s.ListChunkReceipts(ctx)
+	if err != nil {
+		t.Fatalf("ListChunkReceipts() error = %v", err)
+	}
+	if len(receipts) != 1 || !receipts[0].Completed {
+		t.Fatalf("ListChunkReceipts() = %+v, want one completed receipt", receipts)
+	}
+}
+
+func TestSQLiteClearPeerQueueKeepsLeasedRequests(t *testing.T) {
+	s := newTestSQLite(t)
+	ctx := context.Background()
+
+	queuedReq := &models.RelayRequest{
+		ID:        "req-clear-queued",
+		Request:   models.HTTPRequest{URL: "http://127.0.0.1:8080/queued", Method: "GET"},
+		Status:    models.StatusQueued,
+		CreatedAt: time.Now(),
+	}
+	leasedReq := &models.RelayRequest{
+		ID:        "req-clear-leased",
+		Request:   models.HTTPRequest{URL: "http://127.0.0.1:8080/leased", Method: "GET"},
+		Status:    models.StatusQueued,
+		CreatedAt: time.Now(),
+	}
+	if err := s.EnqueueRequest(ctx, "peer-clear", queuedReq); err != nil {
+		t.Fatalf("EnqueueRequest(queued) error = %v", err)
+	}
+	if err := s.EnqueueRequest(ctx, "peer-clear", leasedReq); err != nil {
+		t.Fatalf("EnqueueRequest(leased) error = %v", err)
+	}
+
+	leased, err := s.LeaseRequests(ctx, "peer-clear", 1, time.Minute)
+	if err != nil {
+		t.Fatalf("LeaseRequests() error = %v", err)
+	}
+	if len(leased) != 1 {
+		t.Fatalf("LeaseRequests() len = %d, want 1", len(leased))
+	}
+
+	cleared, err := s.ClearPeerQueue(ctx, "peer-clear")
+	if err != nil {
+		t.Fatalf("ClearPeerQueue() error = %v", err)
+	}
+	if cleared != 1 {
+		t.Fatalf("ClearPeerQueue() = %d, want 1", cleared)
+	}
+
+	clearedID := queuedReq.ID
+	leasedID := leased[0].ID
+	if leasedID == queuedReq.ID {
+		clearedID = leasedReq.ID
+	}
+
+	statusQueued, err := s.GetRequestStatus(ctx, clearedID)
+	if err != nil {
+		t.Fatalf("GetRequestStatus(queued) error = %v", err)
+	}
+	if statusQueued != models.StatusFailed {
+		t.Fatalf("queued request status = %s, want %s", statusQueued, models.StatusFailed)
+	}
+
+	statusLeased, err := s.GetRequestStatus(ctx, leasedID)
+	if err != nil {
+		t.Fatalf("GetRequestStatus(leased) error = %v", err)
+	}
+	if statusLeased != models.StatusLeased {
+		t.Fatalf("leased request status = %s, want %s", statusLeased, models.StatusLeased)
 	}
 }

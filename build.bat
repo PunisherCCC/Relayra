@@ -8,7 +8,12 @@ set HTTP_PROXY=http://127.0.0.1:3066
 set HTTPS_PROXY=http://127.0.0.1:3066
 set GOOS=linux
 set GOARCH=amd64
-set VERSION=0.1.1
+
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\\get-version.ps1"`) do set "VERSION=%%V"
+if not defined VERSION (
+    echo Failed to detect version from internal\cli\root.go
+    exit /b 1
+)
 
 set "DIST=dist\relayra-%VERSION%-linux-amd64"
 set "ARCHIVE=dist\relayra-%VERSION%-linux-amd64.tar.gz"

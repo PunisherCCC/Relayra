@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/relayra/relayra/internal/config"
 )
 
@@ -40,5 +41,35 @@ func TestNextWebSocketBackoffCapsAtMax(t *testing.T) {
 func TestVerifyWebSocketKeepaliveAck(t *testing.T) {
 	if err := verifyWebSocketKeepaliveAck(nil, "", 0); err != nil {
 		t.Fatalf("verifyWebSocketKeepaliveAck() unexpected error for empty expectation: %v", err)
+	}
+}
+
+func TestClassifyWebSocketReadFailureKind(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want webSocketFailureKind
+	}{
+		{
+			name: "server internal close is internal",
+			err:  &websocket.CloseError{Code: websocket.CloseInternalServerErr, Text: "poll handling failed"},
+			want: webSocketFailureInternal,
+		},
+		{
+			name: "policy close is internal",
+			err:  &websocket.CloseError{Code: websocket.ClosePolicyViolation, Text: "peer mismatch"},
+			want: webSocketFailureInternal,
+		},
+		{
+			name: "abnormal close is connection",
+			err:  &websocket.CloseError{Code: websocket.CloseAbnormalClosure, Text: "unexpected EOF"},
+			want: webSocketFailureConnection,
+		},
+	}
+
+	for _, tt := range tests {
+		if got := classifyWebSocketReadFailureKind(tt.err); got != tt.want {
+			t.Fatalf("%s: classifyWebSocketReadFailureKind() = %q, want %q", tt.name, got, tt.want)
+		}
 	}
 }

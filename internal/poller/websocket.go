@@ -219,7 +219,7 @@ func runWebSocketSession(ctx context.Context, cfg *config.Config, rdb store.Back
 		var resp models.PollResponse
 		if err := conn.ReadJSON(&resp); err != nil {
 			result.err = err
-			result.failureKind = webSocketFailureConnection
+			result.failureKind = classifyWebSocketReadFailureKind(err)
 			return result
 		}
 		_ = setWebSocketReadDeadline(conn, cfg)
@@ -313,6 +313,26 @@ func nextWebSocketBackoff(current, max time.Duration) time.Duration {
 		}
 	}
 	return current
+}
+
+func classifyWebSocketReadFailureKind(err error) webSocketFailureKind {
+	if err == nil {
+		return webSocketFailureNone
+	}
+	if closeErr, ok := err.(*websocket.CloseError); ok {
+		switch closeErr.Code {
+		case websocket.CloseInternalServerErr, websocket.ClosePolicyViolation, websocket.CloseUnsupportedData:
+			return webSocketFailureInternal
+		case websocket.CloseNormalClosure:
+			return webSocketFailureNone
+		default:
+			return webSocketFailureConnection
+		}
+	}
+	if netErr, ok := err.(interface{ Timeout() bool }); ok && netErr.Timeout() {
+		return webSocketFailureConnection
+	}
+	return webSocketFailureConnection
 }
 
 func setWebSocketReadDeadline(conn *websocket.Conn, cfg *config.Config) error {

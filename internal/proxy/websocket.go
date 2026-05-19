@@ -10,7 +10,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/relayra/relayra/internal/config"
-	"github.com/relayra/relayra/internal/crypto"
 	"github.com/relayra/relayra/internal/models"
 	xproxy "golang.org/x/net/proxy"
 )
@@ -147,6 +146,25 @@ func runWebSocketReliabilitySample(ctx context.Context, cfg *config.Config, list
 	}()
 	defer close(stopPing)
 
+	helloType := models.WSMessageTypeHello
+	if err := conn.WriteJSON(models.WSMessage{
+		Type:   helloType,
+		PeerID: listener.ID,
+		SentAt: time.Now().UnixMilli(),
+	}); err != nil {
+		sample.DisconnectReason = classifyWebSocketError(err)
+		return sample
+	}
+	var helloResp models.WSMessage
+	if err := conn.ReadJSON(&helloResp); err != nil {
+		sample.DisconnectReason = classifyWebSocketError(err)
+		return sample
+	}
+	if helloResp.Type != models.WSMessageTypeHello && helloResp.Type != models.WSMessageTypeResume {
+		sample.DisconnectReason = fmt.Sprintf("unexpected handshake response %q", helloResp.Type)
+		return sample
+	}
+
 	start := time.Now()
 	deadline := start.Add(holdDuration)
 	sequence := 1
@@ -156,26 +174,14 @@ loop:
 			break
 		}
 		probeID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), sequence)
-		payloadUp := &models.PollPayloadUp{
+		req := models.WSMessage{
+			Type:   models.WSMessageTypeKeepalive,
+			PeerID: listener.ID,
 			Probe: &models.ProbeMessage{
-				ID:        probeID,
-				Sequence:  sequence,
-				SentAt:    time.Now().UnixMilli(),
-				ProbeOnly: true,
+				ID:     probeID,
+				SentAt: time.Now().UnixMilli(),
 			},
-		}
-		ciphertext, nonce, timestamp, err := crypto.EncryptJSON(listener.EncryptionKey, payloadUp)
-		if err != nil {
-			sample.DisconnectReason = err.Error()
-			break
-		}
-
-		req := models.PollRequest{
-			PeerID:      listener.ID,
-			Nonce:       nonce,
-			Timestamp:   timestamp,
-			Payload:     ciphertext,
-			WaitSeconds: 0,
+			SentAt: time.Now().UnixMilli(),
 		}
 
 		sample.ProbesSent++
@@ -185,18 +191,16 @@ loop:
 			break
 		}
 
-		var resp models.PollResponse
+		var resp models.WSMessage
 		if err := conn.ReadJSON(&resp); err != nil {
 			sample.DisconnectReason = classifyWebSocketError(err)
 			break
 		}
-
-		var payloadDown models.PollPayloadDown
-		if err := crypto.DecryptJSON(listener.EncryptionKey, resp.Payload, resp.Nonce, resp.Timestamp, &payloadDown); err != nil {
-			sample.DisconnectReason = "probe decrypt failure"
+		if resp.Type != models.WSMessageTypeKeepalive {
+			sample.DisconnectReason = fmt.Sprintf("unexpected probe response %q", resp.Type)
 			break
 		}
-		if payloadDown.Probe == nil || !payloadDown.Probe.Ack || payloadDown.Probe.ID != probeID || payloadDown.Probe.Sequence != sequence {
+		if resp.Probe == nil || !resp.Probe.Ack || resp.Probe.ID != probeID {
 			sample.DisconnectReason = "probe acknowledgement mismatch"
 			break
 		}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/relayra/relayra/internal/buildinfo"
 	"github.com/relayra/relayra/internal/config"
 	"github.com/relayra/relayra/internal/logger"
 	"github.com/relayra/relayra/internal/poller"
@@ -32,7 +33,7 @@ var runCmd = &cobra.Command{
 
 		// Startup diagnostic block
 		slog.Info("Relayra starting",
-			"version", Version,
+			"version", buildinfo.Version,
 			"role", cfg.Role,
 			"instance", cfg.InstanceName,
 			"machine_id", cfg.MachineID,

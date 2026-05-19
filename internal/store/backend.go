@@ -44,6 +44,7 @@ type Backend interface {
 	QueueLength(ctx context.Context, peerID string) (int64, error)
 	ClearPeerQueue(ctx context.Context, peerID string) (int64, error)
 	GetRequestStatus(ctx context.Context, requestID string) (models.RequestStatus, error)
+	GetRequest(ctx context.Context, requestID string) (*models.RelayRequest, error)
 	GetRequestWebhookURL(ctx context.Context, requestID string) (string, error)
 	UpdateRequestStatus(ctx context.Context, requestID string, status models.RequestStatus) error
 	ApplyRequestStates(ctx context.Context, requestStates []models.RequestSyncState) error
@@ -58,6 +59,12 @@ type Backend interface {
 	GetSenderRequestState(ctx context.Context, requestID string) (*models.RequestSyncState, error)
 	ListSenderRequestStates(ctx context.Context) ([]models.RequestSyncState, error)
 	DeleteSenderRequestStates(ctx context.Context, requestIDs []string) error
+	NextWSOutboundSeq(ctx context.Context, scope string) (int64, error)
+	EnqueueWSOutbox(ctx context.Context, scope string, seq int64, msgType, refID, payload string) error
+	ListWSOutbox(ctx context.Context, scope string, afterSeq int64, limit int) ([]models.WSOutboxMessage, error)
+	AckWSOutboxThrough(ctx context.Context, scope string, seq int64) ([]models.WSOutboxMessage, error)
+	GetWSSequenceState(ctx context.Context, scope string) (*models.WSSequenceState, error)
+	SetWSLastReceivedSeq(ctx context.Context, scope string, seq int64) error
 	StoreInboundChunk(ctx context.Context, chunk models.TransportChunk, ttl time.Duration) (*models.ChunkReceipt, *models.RelayRequest, error)
 	ListChunkReceipts(ctx context.Context) ([]models.ChunkReceipt, error)
 	DeleteChunkReceipt(ctx context.Context, transferID string) error
@@ -92,7 +99,7 @@ type Backend interface {
 func Open(cfg *config.Config) (Backend, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.StorageBackend)) {
 	case "", "redis":
-		return NewRedis(cfg.RedisURL(), cfg.RedisPassword, cfg.RedisDB)
+		return NewRedis(cfg.RedisURL(), cfg.RedisPassword, cfg.RedisDB, cfg.RedisPoolSize)
 	case "sqlite":
 		return NewSQLite(cfg.SQLitePath)
 	default:

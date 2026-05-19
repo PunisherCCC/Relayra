@@ -47,7 +47,7 @@ func Run(ctx context.Context, cfg *config.Config, rdb store.Backend) error {
 		"async_workers", cfg.AsyncWorkers,
 		"proxy_cooldown_seconds", cfg.ProxyCooldownSeconds,
 	)
-	dispatcher := newDispatcher(cfg, rdb)
+	dispatcher := newDispatcher(cfg, rdb, listenerInfo.ID)
 	defer dispatcher.Close()
 
 	sigCh := make(chan os.Signal, 1)
@@ -312,6 +312,11 @@ func handleIncomingRequest(ctx context.Context, cfg *config.Config, rdb store.Ba
 	}
 	if err := rdb.StoreSenderRequestState(reqCtx, receivedState); err != nil {
 		return err
+	}
+	if err := queueSenderRequestStateWS(reqCtx, rdb, dispatcher.listenerID, *receivedState); err != nil {
+		slog.ErrorContext(reqCtx, "failed to queue received websocket state", "error", err)
+	} else {
+		dispatcher.NotifyOutbox()
 	}
 
 	if !shouldDispatch {

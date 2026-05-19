@@ -141,6 +141,15 @@ func (r *Redis) GetRequestStatus(ctx context.Context, requestID string) (models.
 	return models.RequestStatus(status), nil
 }
 
+// GetRequest retrieves a stored relay request by ID.
+func (r *Redis) GetRequest(ctx context.Context, requestID string) (*models.RelayRequest, error) {
+	req, _, err := r.loadRequestEnvelope(ctx, requestID)
+	if err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
 // GetRequestWebhookURL returns the webhook URL for a request.
 func (r *Redis) GetRequestWebhookURL(ctx context.Context, requestID string) (string, error) {
 	url, err := r.Client.HGet(ctx, keyRequestPrefix+requestID, "webhook_url").Result()

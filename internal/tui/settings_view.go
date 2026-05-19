@@ -36,6 +36,7 @@ var editableKeys = map[string]bool{
 	"redis_addr":               true,
 	"redis_port":               true,
 	"redis_db":                 true,
+	"redis_pool_size":          true,
 	"poll_interval":            true,
 	"poll_batch_size":          true,
 	"request_timeout":          true,
@@ -80,6 +81,7 @@ func NewSettingsView(cfg *config.Config, rdb store.Backend) *SettingsView {
 		{"Redis Address", cfg.RedisAddr, "redis_addr"},
 		{"Redis Port", fmt.Sprintf("%d", cfg.RedisPort), "redis_port"},
 		{"Redis DB", fmt.Sprintf("%d", cfg.RedisDB), "redis_db"},
+		{"Redis Pool Size", fmt.Sprintf("%d", cfg.RedisPoolSize), "redis_pool_size"},
 		{"Poll Interval", fmt.Sprintf("%d", cfg.PollInterval), "poll_interval"},
 		{"Poll Batch Size", fmt.Sprintf("%d", cfg.PollBatchSize), "poll_batch_size"},
 		{"Request Timeout", fmt.Sprintf("%d", cfg.RequestTimeout), "request_timeout"},
@@ -211,6 +213,11 @@ func (sv *SettingsView) applyEdit() tea.Cmd {
 		case "redis_db":
 			if v, err := strconv.Atoi(newVal); err == nil && v >= 0 {
 				sv.cfg.RedisDB = v
+				sv.items[sv.cursor].Value = newVal
+			}
+		case "redis_pool_size":
+			if v, err := strconv.Atoi(newVal); err == nil && v >= 1 {
+				sv.cfg.RedisPoolSize = v
 				sv.items[sv.cursor].Value = newVal
 			}
 		case "poll_interval":

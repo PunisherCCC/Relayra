@@ -15,22 +15,26 @@ import (
 )
 
 type dispatcher struct {
-	cfg      *config.Config
-	rdb      store.Backend
-	asyncSem chan struct{}
-	serialCh chan models.RelayRequest
-	wg       sync.WaitGroup
-	inFlight atomic.Int64
-	leaseTTL time.Duration
+	cfg          *config.Config
+	rdb          store.Backend
+	listenerID   string
+	asyncSem     chan struct{}
+	serialCh     chan models.RelayRequest
+	outboxSignal chan struct{}
+	wg           sync.WaitGroup
+	inFlight     atomic.Int64
+	leaseTTL     time.Duration
 }
 
-func newDispatcher(cfg *config.Config, rdb store.Backend) *dispatcher {
+func newDispatcher(cfg *config.Config, rdb store.Backend, listenerID string) *dispatcher {
 	d := &dispatcher{
-		cfg:      cfg,
-		rdb:      rdb,
-		asyncSem: make(chan struct{}, cfg.AsyncWorkers),
-		serialCh: make(chan models.RelayRequest, cfg.PollBatchSize*2),
-		leaseTTL: senderRequestLeaseDuration(cfg),
+		cfg:          cfg,
+		rdb:          rdb,
+		listenerID:   listenerID,
+		asyncSem:     make(chan struct{}, cfg.AsyncWorkers),
+		serialCh:     make(chan models.RelayRequest, cfg.PollBatchSize*2),
+		outboxSignal: make(chan struct{}, 1),
+		leaseTTL:     senderRequestLeaseDuration(cfg),
 	}
 
 	d.wg.Add(1)
@@ -78,6 +82,16 @@ func (d *dispatcher) execute(ctx context.Context, req *models.RelayRequest) {
 	}); err != nil {
 		slog.ErrorContext(ctx, "failed to mark request executing", "error", err)
 	}
+	if err := queueSenderRequestStateWS(ctx, d.rdb, d.listenerID, models.RequestSyncState{
+		RequestID:  req.ID,
+		Status:     models.StatusExecuting,
+		LeaseUntil: now.Add(d.leaseTTL),
+		UpdatedAt:  now,
+	}); err != nil {
+		slog.ErrorContext(ctx, "failed to queue executing websocket state", "error", err)
+	} else {
+		d.NotifyOutbox()
+	}
 
 	slog.InfoContext(ctx, "dispatching request for execution",
 		"url", req.Request.URL,
@@ -90,6 +104,11 @@ func (d *dispatcher) execute(ctx context.Context, req *models.RelayRequest) {
 		slog.ErrorContext(ctx, "failed to store result locally", "error", err)
 		return
 	}
+	if err := queueSenderResultWS(ctx, d.rdb, d.listenerID, result); err != nil {
+		slog.ErrorContext(ctx, "failed to queue websocket result", "error", err)
+	} else {
+		d.NotifyOutbox()
+	}
 
 	doneAt := time.Now()
 	if err := d.rdb.StoreSenderRequestState(ctx, &models.RequestSyncState{
@@ -100,6 +119,16 @@ func (d *dispatcher) execute(ctx context.Context, req *models.RelayRequest) {
 	}); err != nil {
 		slog.ErrorContext(ctx, "failed to mark request completed", "error", err)
 	}
+	if err := queueSenderRequestStateWS(ctx, d.rdb, d.listenerID, models.RequestSyncState{
+		RequestID:  req.ID,
+		Status:     models.StatusCompleted,
+		LeaseUntil: doneAt.Add(d.leaseTTL),
+		UpdatedAt:  doneAt,
+	}); err != nil {
+		slog.ErrorContext(ctx, "failed to queue completed websocket state", "error", err)
+	} else {
+		d.NotifyOutbox()
+	}
 }
 
 func (d *dispatcher) InFlight() int64 {
@@ -109,4 +138,11 @@ func (d *dispatcher) InFlight() int64 {
 func (d *dispatcher) Close() {
 	close(d.serialCh)
 	d.wg.Wait()
+}
+
+func (d *dispatcher) NotifyOutbox() {
+	select {
+	case d.outboxSignal <- struct{}{}:
+	default:
+	}
 }

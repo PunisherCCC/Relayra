@@ -50,6 +50,7 @@ type Config struct {
 	RedisPort     int    `env:"RELAYRA_REDIS_PORT"`
 	RedisPassword string `env:"RELAYRA_REDIS_PASSWORD"`
 	RedisDB       int    `env:"RELAYRA_REDIS_DB"`
+	RedisPoolSize int    `env:"RELAYRA_REDIS_POOL_SIZE"`
 
 	// Polling (Sender)
 	PollInterval             int    `env:"RELAYRA_POLL_INTERVAL"`
@@ -93,6 +94,7 @@ func DefaultConfig() *Config {
 		RedisPort:                6379,
 		RedisPassword:            "",
 		RedisDB:                  0,
+		RedisPoolSize:            64,
 		PollInterval:             5,
 		PollBatchSize:            10,
 		RequestTimeout:           30,
@@ -156,6 +158,7 @@ func Load() (*Config, error) {
 	cfg.RedisPort = getEnvInt("RELAYRA_REDIS_PORT", cfg.RedisPort)
 	cfg.RedisPassword = getEnvStr("RELAYRA_REDIS_PASSWORD", cfg.RedisPassword)
 	cfg.RedisDB = getEnvInt("RELAYRA_REDIS_DB", cfg.RedisDB)
+	cfg.RedisPoolSize = getEnvInt("RELAYRA_REDIS_POOL_SIZE", cfg.RedisPoolSize)
 	cfg.PollInterval = getEnvInt("RELAYRA_POLL_INTERVAL", cfg.PollInterval)
 	cfg.PollBatchSize = getEnvInt("RELAYRA_POLL_BATCH_SIZE", cfg.PollBatchSize)
 	cfg.RequestTimeout = getEnvInt("RELAYRA_REQUEST_TIMEOUT", cfg.RequestTimeout)
@@ -225,6 +228,7 @@ func Save(cfg *Config) error {
 		fmt.Sprintf("RELAYRA_REDIS_PORT=%d", cfg.RedisPort),
 		fmt.Sprintf("RELAYRA_REDIS_PASSWORD=%s", cfg.RedisPassword),
 		fmt.Sprintf("RELAYRA_REDIS_DB=%d", cfg.RedisDB),
+		fmt.Sprintf("RELAYRA_REDIS_POOL_SIZE=%d", cfg.RedisPoolSize),
 		"",
 		"# Polling (Sender)",
 		fmt.Sprintf("RELAYRA_POLL_INTERVAL=%d", cfg.PollInterval),
@@ -289,6 +293,9 @@ func (c *Config) Validate() error {
 	}
 	if c.RedisPort < 1 || c.RedisPort > 65535 {
 		return fmt.Errorf("RELAYRA_REDIS_PORT must be between 1 and 65535, got %d", c.RedisPort)
+	}
+	if c.RedisPoolSize < 1 {
+		return fmt.Errorf("RELAYRA_REDIS_POOL_SIZE must be >= 1, got %d", c.RedisPoolSize)
 	}
 	if c.PollInterval < 1 {
 		return fmt.Errorf("RELAYRA_POLL_INTERVAL must be >= 1 second, got %d", c.PollInterval)
@@ -457,7 +464,7 @@ func (c *Config) Capabilities() []string {
 	case TransportModeLongPoll:
 		caps = append(caps, "long-poll")
 	case TransportModeWebSocket:
-		caps = append(caps, "websocket", "ws-keepalive")
+		caps = append(caps, "websocket", "ws-keepalive", "ws-push", "ws-replay")
 		if c.WSEnableLongPollFallback {
 			caps = append(caps, "long-poll-fallback")
 		} else {

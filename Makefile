@@ -1,4 +1,4 @@
-VERSION ?= 0.1.1
+VERSION ?= $(shell sed -n 's/.*Version = "\(.*\)".*/\1/p' internal/buildinfo/buildinfo.go)
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 MODULE := github.com/relayra/relayra
@@ -7,8 +7,8 @@ BUILD_DIR := build
 DIST_DIR := dist
 
 LDFLAGS := -s -w \
-	-X '$(MODULE)/internal/cli.Version=$(VERSION)' \
-	-X '$(MODULE)/internal/cli.BuildDate=$(BUILD_DATE)'
+	-X '$(MODULE)/internal/buildinfo.Version=$(VERSION)' \
+	-X '$(MODULE)/internal/buildinfo.BuildDate=$(BUILD_DATE)'
 
 GOOS := linux
 GOARCH := amd64

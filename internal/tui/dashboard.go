@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/relayra/relayra/internal/buildinfo"
 	"github.com/relayra/relayra/internal/config"
 	"github.com/relayra/relayra/internal/store"
 )
@@ -22,6 +23,7 @@ type Dashboard struct {
 type dashboardInfo struct {
 	Role           string
 	InstanceName   string
+	Version        string
 	MachineID      string
 	ListenAddr     string
 	StorageBackend string
@@ -56,6 +58,7 @@ func (d *Dashboard) fetchInfo() tea.Msg {
 	info := dashboardInfo{
 		Role:           string(d.cfg.Role),
 		InstanceName:   d.cfg.InstanceName,
+		Version:        buildinfo.Version,
 		MachineID:      d.cfg.MachineID,
 		ListenAddr:     d.cfg.ListenAddress(),
 		StorageBackend: d.cfg.StorageBackend,
@@ -123,6 +126,7 @@ func (d *Dashboard) View() string {
 
 	b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("Role:"), valueStyle.Render(d.info.Role)))
 	b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("Instance:"), valueStyle.Render(d.info.InstanceName)))
+	b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("Version:"), valueStyle.Render(d.info.Version)))
 	b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("Machine ID:"), valueStyle.Render(d.info.MachineID)))
 	b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle.Render("Listen:"), valueStyle.Render(d.info.ListenAddr)))
 

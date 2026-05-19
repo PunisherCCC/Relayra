@@ -11,7 +11,7 @@ set GOARCH=amd64
 
 for /f "usebackq delims=" %%V in (`powershell -NoProfile -ExecutionPolicy Bypass -File "scripts\\get-version.ps1"`) do set "VERSION=%%V"
 if not defined VERSION (
-    echo Failed to detect version from internal\cli\root.go
+    echo Failed to detect version from internal\buildinfo\buildinfo.go
     exit /b 1
 )
 
@@ -24,7 +24,7 @@ if exist "%ARCHIVE%" del /q "%ARCHIVE%"
 
 echo [2/4] Compiling for linux/amd64...
 mkdir "%DIST%\scripts" 2>nul
-go build -ldflags "-X github.com/relayra/relayra/internal/cli.Version=%VERSION%" -o "%DIST%\relayra" ./cmd/relayra
+go build -ldflags "-X github.com/relayra/relayra/internal/buildinfo.Version=%VERSION%" -o "%DIST%\relayra" ./cmd/relayra
 if errorlevel 1 (
     echo BUILD FAILED
     exit /b 1

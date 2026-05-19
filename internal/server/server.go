@@ -27,7 +27,8 @@ func Run(ctx context.Context, cfg *config.Config, rdb store.Backend) error {
 	)
 
 	mux := http.NewServeMux()
-	h := &Handlers{rdb: rdb, cfg: cfg}
+	hub := newWSHub()
+	h := &Handlers{rdb: rdb, cfg: cfg, wsHub: hub}
 
 	// Register routes
 	mux.HandleFunc("GET /health", h.Health)

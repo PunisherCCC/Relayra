@@ -1,8 +1,8 @@
-$content = Get-Content "internal/cli/root.go" -Raw
+$content = Get-Content "internal/buildinfo/buildinfo.go" -Raw
 $match = [regex]::Match($content, 'Version\s*=\s*"([^"]+)"')
 
 if (-not $match.Success) {
-    Write-Error "Failed to detect version from internal/cli/root.go"
+    Write-Error "Failed to detect version from internal/buildinfo/buildinfo.go"
     exit 1
 }
 

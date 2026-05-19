@@ -8,12 +8,6 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var (
-	// Version is set via ldflags at build time.
-	Version   = "0.1.2"
-	BuildDate = "unknown"
-)
-
 var rootCmd = &cobra.Command{
 	Use:   "relayra",
 	Short: "Relayra — Restricted Server Relay System",

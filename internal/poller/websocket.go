@@ -10,11 +10,11 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/relayra/relayra/internal/config"
-	"github.com/relayra/relayra/internal/crypto"
 	"github.com/relayra/relayra/internal/logger"
 	"github.com/relayra/relayra/internal/models"
 	"github.com/relayra/relayra/internal/proxy"
 	"github.com/relayra/relayra/internal/store"
+	"github.com/relayra/relayra/internal/transport"
 )
 
 type webSocketFailureKind string
@@ -32,6 +32,26 @@ type webSocketSessionResult struct {
 	err         error
 	proxyURL    string
 	failureKind webSocketFailureKind
+}
+
+type senderWebSocketSession struct {
+	cfg             *config.Config
+	rdb             store.Backend
+	listenerInfo    *models.Peer
+	dispatcher      *dispatcher
+	conn            *websocket.Conn
+	scope           string
+	sendCh          chan models.WSMessage
+	notifyCh        chan struct{}
+	doneCh          chan struct{}
+	errCh           chan sessionErr
+	lastSentSeq     int64
+	lastReceivedSeq int64
+}
+
+type sessionErr struct {
+	err  error
+	kind webSocketFailureKind
 }
 
 func runWebSocketMode(ctx context.Context, cfg *config.Config, rdb store.Backend,
@@ -143,31 +163,73 @@ func runWebSocketSession(ctx context.Context, cfg *config.Config, rdb store.Back
 	}
 	defer conn.Close()
 
-	sessionCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	scope := models.SenderWSScope(listenerInfo.ID)
+	state, err := rdb.GetWSSequenceState(ctx, scope)
+	if err != nil {
+		result.err = err
+		result.failureKind = webSocketFailureInternal
+		return result
+	}
+	lastReceivedSeq := int64(0)
+	if state != nil {
+		lastReceivedSeq = state.LastReceivedSeq
+	}
 
-	slog.InfoContext(ctx, "websocket transport established", "proxy", proxyURL, "listener", listenerInfo.Address)
+	helloType := models.WSMessageTypeHello
+	if lastReceivedSeq > 0 {
+		helloType = models.WSMessageTypeResume
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(cfg.WSWriteTimeoutDuration()))
+	if err := conn.WriteJSON(models.WSMessage{
+		Type:            helloType,
+		PeerID:          listenerInfo.ID,
+		LastReceivedSeq: lastReceivedSeq,
+		SentAt:          time.Now().UnixMilli(),
+	}); err != nil {
+		result.err = err
+		result.failureKind = webSocketFailureConnection
+		return result
+	}
 
-	_ = setWebSocketReadDeadline(conn, cfg)
+	_ = conn.SetReadDeadline(time.Now().Add(cfg.WSIdleTimeoutDuration()))
 	conn.SetPongHandler(func(string) error {
-		return setWebSocketReadDeadline(conn, cfg)
+		return conn.SetReadDeadline(time.Now().Add(cfg.WSIdleTimeoutDuration()))
 	})
 
-	pingTicker := time.NewTicker(cfg.WSPingIntervalDuration())
-	defer pingTicker.Stop()
+	var helloResp models.WSMessage
+	if err := conn.ReadJSON(&helloResp); err != nil {
+		result.err = err
+		result.failureKind = classifyWebSocketReadFailureKind(err)
+		return result
+	}
+	if helloResp.Type != models.WSMessageTypeHello && helloResp.Type != models.WSMessageTypeResume {
+		result.err = fmt.Errorf("unexpected websocket handshake response %q", helloResp.Type)
+		result.failureKind = webSocketFailureInternal
+		return result
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(cfg.WSIdleTimeoutDuration()))
 
-	go func() {
-		for {
-			select {
-			case <-pingTicker.C:
-				_ = conn.WriteControl(websocket.PingMessage, []byte("relayra"), time.Now().Add(cfg.WSWriteTimeoutDuration()))
-			case <-sessionCtx.Done():
-				return
-			}
-		}
-	}()
+	session := &senderWebSocketSession{
+		cfg:             cfg,
+		rdb:             rdb,
+		listenerInfo:    listenerInfo,
+		dispatcher:      dispatcher,
+		conn:            conn,
+		scope:           scope,
+		sendCh:          make(chan models.WSMessage, 16),
+		notifyCh:        dispatcher.outboxSignal,
+		doneCh:          make(chan struct{}),
+		errCh:           make(chan sessionErr, 1),
+		lastSentSeq:     helloResp.LastReceivedSeq,
+		lastReceivedSeq: lastReceivedSeq,
+	}
 
-	probeSequence := 0
+	slog.InfoContext(ctx, "websocket transport established", "proxy", proxyURL, "listener", listenerInfo.Address)
+	go session.writerLoop()
+	session.NotifyFlush()
+	result.stable = true
+	defer close(session.doneCh)
+
 	for {
 		select {
 		case sig := <-sigCh:
@@ -182,127 +244,230 @@ func runWebSocketSession(ctx context.Context, cfg *config.Config, rdb store.Back
 		default:
 		}
 
-		*cycle = *cycle + 1
-		pollCtx := logger.WithPollCycle(ctx, *cycle)
-
-		payloadUp, leasedResults, err := buildPayloadUp(pollCtx, cfg, rdb)
-		if err != nil {
-			result.err = err
-			result.failureKind = webSocketFailureInternal
-			return result
-		}
-		waitSeconds := requestedWebSocketWait(cfg, dispatcher)
-		expectedProbeID, expectedProbeSeq := attachWebSocketKeepaliveProbe(payloadUp, &probeSequence)
-
-		ciphertext, nonce, timestamp, err := crypto.EncryptJSON(listenerInfo.EncryptionKey, payloadUp)
-		if err != nil {
-			result.err = err
-			result.failureKind = webSocketFailureInternal
-			return result
-		}
-
-		req := models.PollRequest{
-			PeerID:      listenerInfo.ID,
-			Nonce:       nonce,
-			Timestamp:   timestamp,
-			Payload:     ciphertext,
-			WaitSeconds: waitSeconds,
-		}
-
-		_ = conn.SetWriteDeadline(time.Now().Add(cfg.WSWriteTimeoutDuration()))
-		if err := conn.WriteJSON(req); err != nil {
-			result.err = err
-			result.failureKind = webSocketFailureConnection
-			return result
-		}
-
-		var resp models.PollResponse
-		if err := conn.ReadJSON(&resp); err != nil {
+		var msg models.WSMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			select {
+			case writerErr := <-session.errCh:
+				result.err = writerErr.err
+				result.failureKind = writerErr.kind
+				return result
+			default:
+			}
 			result.err = err
 			result.failureKind = classifyWebSocketReadFailureKind(err)
 			return result
 		}
-		_ = setWebSocketReadDeadline(conn, cfg)
+		_ = conn.SetReadDeadline(time.Now().Add(cfg.WSIdleTimeoutDuration()))
 
-		var payloadDown models.PollPayloadDown
-		if err := crypto.DecryptJSON(listenerInfo.EncryptionKey, resp.Payload, resp.Nonce, resp.Timestamp, &payloadDown); err != nil {
-			result.err = err
-			result.failureKind = webSocketFailureInternal
-			return result
-		}
-		if err := verifyWebSocketKeepaliveAck(payloadDown.Probe, expectedProbeID, expectedProbeSeq); err != nil {
-			result.err = err
-			result.failureKind = webSocketFailureInternal
-			return result
-		}
-		if err := processPollResponse(pollCtx, cfg, rdb, dispatcher, &payloadDown); err != nil {
-			result.err = err
-			result.failureKind = webSocketFailureInternal
-			return result
+		if msg.Type == models.WSMessageTypeAck {
+			if ackErr := handleSenderOutboxAck(ctx, rdb, scope, msg.Ack); ackErr != nil {
+				result.err = ackErr
+				result.failureKind = webSocketFailureInternal
+				return result
+			}
+			continue
 		}
 
-		proxyMgr.MarkSuccess(pollCtx, proxyURL)
+		if msg.Type == models.WSMessageTypeKeepalive {
+			if msg.Probe != nil && !msg.Probe.Ack {
+				if !session.Send(models.WSMessage{
+					Type:   models.WSMessageTypeKeepalive,
+					PeerID: listenerInfo.ID,
+					Probe: &models.ProbeMessage{
+						ID:       msg.Probe.ID,
+						Sequence: msg.Probe.Sequence,
+						SentAt:   msg.Probe.SentAt,
+						Ack:      true,
+					},
+					SentAt: time.Now().UnixMilli(),
+				}) {
+					result.err = fmt.Errorf("failed to send keepalive ack")
+					result.failureKind = webSocketFailureConnection
+					return result
+				}
+			}
+			continue
+		}
 
-		slog.InfoContext(pollCtx, "websocket sync completed",
-			"new_requests", len(payloadDown.Requests),
-			"chunked_requests", len(payloadDown.RequestChunks),
-			"acked_results", len(payloadDown.AckResultIDs),
-			"results_sent", len(leasedResults),
-			"known_request_states", len(payloadUp.RequestStates),
-			"chunk_receipts", len(payloadUp.ChunkReceipts),
-			"wait_seconds", waitSeconds,
-		)
-		result.stable = true
-
-		if dispatcher.InFlight() > 0 {
-			if !sleepWithCancel(ctx, sigCh, activeWorkPollInterval) {
-				_ = writeWebSocketClose(conn, cfg, websocket.CloseNormalClosure, "dispatcher idle exit")
-				result.shutdown = true
+		if msg.Seq > 0 {
+			if msg.Seq <= session.lastReceivedSeq {
+				_ = session.Send(models.WSMessage{Type: models.WSMessageTypeAck, PeerID: listenerInfo.ID, Ack: session.lastReceivedSeq, SentAt: time.Now().UnixMilli()})
+				continue
+			}
+			if msg.Seq != session.lastReceivedSeq+1 {
+				result.err = fmt.Errorf("out-of-order websocket sequence expected %d got %d", session.lastReceivedSeq+1, msg.Seq)
+				result.failureKind = webSocketFailureInternal
 				return result
 			}
 		}
+
+		if err := session.handleInbound(ctx, &msg, cycle); err != nil {
+			result.err = err
+			result.failureKind = webSocketFailureInternal
+			return result
+		}
+		if msg.Seq > 0 {
+			if err := rdb.SetWSLastReceivedSeq(ctx, scope, msg.Seq); err != nil {
+				result.err = err
+				result.failureKind = webSocketFailureInternal
+				return result
+			}
+			session.lastReceivedSeq = msg.Seq
+			if !session.Send(models.WSMessage{Type: models.WSMessageTypeAck, PeerID: listenerInfo.ID, Ack: msg.Seq, SentAt: time.Now().UnixMilli()}) {
+				result.err = fmt.Errorf("failed to send websocket ack")
+				result.failureKind = webSocketFailureConnection
+				return result
+			}
+			proxyMgr.MarkSuccess(ctx, proxyURL)
+		}
 	}
 }
 
-func attachWebSocketKeepaliveProbe(payloadUp *models.PollPayloadUp, sequence *int) (string, int) {
-	if payloadUp == nil || sequence == nil {
-		return "", 0
+func (s *senderWebSocketSession) NotifyFlush() {
+	select {
+	case s.notifyCh <- struct{}{}:
+	default:
 	}
-	*sequence = *sequence + 1
-	probeID := fmt.Sprintf("runtime-%d-%d", time.Now().UnixNano(), *sequence)
-	payloadUp.Probe = &models.ProbeMessage{
-		ID:       probeID,
-		Sequence: *sequence,
-		SentAt:   time.Now().UnixMilli(),
-	}
-	return probeID, *sequence
 }
 
-func verifyWebSocketKeepaliveAck(probe *models.ProbeMessage, expectedID string, expectedSeq int) error {
-	if expectedID == "" {
-		return nil
+func (s *senderWebSocketSession) Send(msg models.WSMessage) bool {
+	select {
+	case <-s.doneCh:
+		return false
+	case s.sendCh <- msg:
+		return true
 	}
-	if probe == nil {
-		return fmt.Errorf("websocket keepalive acknowledgement missing")
+}
+
+func (s *senderWebSocketSession) writerLoop() {
+	pingTicker := time.NewTicker(s.cfg.WSPingIntervalDuration())
+	defer pingTicker.Stop()
+	keepaliveTicker := time.NewTicker(s.cfg.WSKeepaliveIntervalDuration())
+	defer keepaliveTicker.Stop()
+
+	for {
+		select {
+		case <-s.doneCh:
+			return
+		case msg := <-s.sendCh:
+			if err := s.writeJSON(msg); err != nil {
+				s.errCh <- sessionErr{err: err, kind: webSocketFailureConnection}
+				_ = s.conn.Close()
+				return
+			}
+		case <-s.notifyCh:
+			if err := s.flushOutbox(); err != nil {
+				s.errCh <- sessionErr{err: err, kind: webSocketFailureConnection}
+				_ = s.conn.Close()
+				return
+			}
+		case <-pingTicker.C:
+			if err := s.conn.WriteControl(websocket.PingMessage, []byte("relayra"), time.Now().Add(s.cfg.WSWriteTimeoutDuration())); err != nil {
+				s.errCh <- sessionErr{err: err, kind: webSocketFailureConnection}
+				_ = s.conn.Close()
+				return
+			}
+		case <-keepaliveTicker.C:
+			_ = s.writeJSON(models.WSMessage{
+				Type:   models.WSMessageTypeKeepalive,
+				PeerID: s.listenerInfo.ID,
+				Probe: &models.ProbeMessage{
+					ID:     fmt.Sprintf("sender-%d", time.Now().UnixNano()),
+					SentAt: time.Now().UnixMilli(),
+				},
+				SentAt: time.Now().UnixMilli(),
+			})
+		}
 	}
-	if !probe.Ack || probe.ID != expectedID || probe.Sequence != expectedSeq {
-		return fmt.Errorf("websocket keepalive acknowledgement mismatch")
+}
+
+func (s *senderWebSocketSession) flushOutbox() error {
+	entries, err := s.rdb.ListWSOutbox(context.Background(), s.scope, s.lastSentSeq, 64)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		msg, err := transport.DecodeWSOutboxMessage(entry)
+		if err != nil {
+			return err
+		}
+		if err := s.writeJSON(*msg); err != nil {
+			return err
+		}
+		s.lastSentSeq = entry.Seq
 	}
 	return nil
 }
 
-func requestedWebSocketWait(cfg *config.Config, dispatcher *dispatcher) int {
-	if dispatcher.InFlight() > 0 {
-		return 0
+func (s *senderWebSocketSession) writeJSON(msg models.WSMessage) error {
+	_ = s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WSWriteTimeoutDuration()))
+	return s.conn.WriteJSON(msg)
+}
+
+func (s *senderWebSocketSession) handleInbound(ctx context.Context, msg *models.WSMessage, cycle *int64) error {
+	switch msg.Type {
+	case models.WSMessageTypePushRequest:
+		if msg.Request == nil {
+			return fmt.Errorf("push_request payload missing")
+		}
+		*cycle = *cycle + 1
+		reqCtx := logger.WithPollCycle(ctx, *cycle)
+		return handleIncomingRequest(reqCtx, s.cfg, s.rdb, s.dispatcher, *msg.Request)
+	case models.WSMessageTypePushChunk:
+		if msg.Chunk == nil {
+			return fmt.Errorf("push_chunk payload missing")
+		}
+		receipt, req, err := s.rdb.StoreInboundChunk(ctx, *msg.Chunk, senderRequestLeaseDuration(s.cfg))
+		if err != nil {
+			return err
+		}
+		if receipt != nil {
+			if err := queueSenderChunkReceiptWS(ctx, s.rdb, s.listenerInfo.ID, *receipt); err != nil {
+				return err
+			}
+			s.dispatcher.NotifyOutbox()
+		}
+		if req != nil {
+			*cycle = *cycle + 1
+			reqCtx := logger.WithPollCycle(ctx, *cycle)
+			if err := handleIncomingRequest(reqCtx, s.cfg, s.rdb, s.dispatcher, *req); err != nil {
+				return err
+			}
+		}
+		return nil
+	case models.WSMessageTypeHello, models.WSMessageTypeResume:
+		return nil
+	default:
+		return fmt.Errorf("unsupported websocket message type %q", msg.Type)
 	}
-	waitSeconds := cfg.LongPollWait
-	if cfg.WSKeepaliveInterval > 0 && (waitSeconds == 0 || cfg.WSKeepaliveInterval < waitSeconds) {
-		waitSeconds = cfg.WSKeepaliveInterval
+}
+
+func handleSenderOutboxAck(ctx context.Context, rdb store.Backend, scope string, ackSeq int64) error {
+	acked, err := rdb.AckWSOutboxThrough(ctx, scope, ackSeq)
+	if err != nil {
+		return err
 	}
-	if waitSeconds < 0 {
-		return 0
+	resultIDs := make([]string, 0)
+	for _, entry := range acked {
+		switch entry.Type {
+		case models.WSMessageTypeResult:
+			if entry.RefID != "" {
+				resultIDs = append(resultIDs, entry.RefID)
+			}
+		case models.WSMessageTypeChunkReceipt:
+			if entry.RefID != "" {
+				if err := rdb.DeleteChunkReceipt(ctx, entry.RefID); err != nil {
+					return err
+				}
+			}
+		}
 	}
-	return waitSeconds
+	if len(resultIDs) > 0 {
+		if err := rdb.AckResults(ctx, resultIDs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func nextWebSocketBackoff(current, max time.Duration) time.Duration {
@@ -333,10 +498,6 @@ func classifyWebSocketReadFailureKind(err error) webSocketFailureKind {
 		return webSocketFailureConnection
 	}
 	return webSocketFailureConnection
-}
-
-func setWebSocketReadDeadline(conn *websocket.Conn, cfg *config.Config) error {
-	return conn.SetReadDeadline(time.Now().Add(cfg.WSIdleTimeoutDuration()))
 }
 
 func writeWebSocketClose(conn *websocket.Conn, cfg *config.Config, code int, reason string) error {

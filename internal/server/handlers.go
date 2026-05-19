@@ -24,8 +24,9 @@ import (
 
 // Handlers holds dependencies for HTTP handlers.
 type Handlers struct {
-	rdb store.Backend
-	cfg *config.Config
+	rdb   store.Backend
+	cfg   *config.Config
+	wsHub *wsHub
 }
 
 func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
@@ -128,6 +129,9 @@ func (h *Handlers) Relay(w http.ResponseWriter, r *http.Request) {
 		slog.ErrorContext(ctx, "failed to enqueue relay request", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to queue request"})
 		return
+	}
+	if err := h.queueListenerRequestEvent(ctx, req.DestinationPeerID, *relayReq); err != nil {
+		slog.ErrorContext(ctx, "failed to queue websocket delivery event", "error", err)
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
@@ -347,6 +351,93 @@ func (h *Handlers) isListenerDestination(destinationID string) bool {
 	default:
 		return false
 	}
+}
+
+func (h *Handlers) queueListenerRequestEvent(ctx context.Context, peerID string, req models.RelayRequest) error {
+	needsChunking, _, err := transport.RequestNeedsChunking(req, h.cfg.TransportChunkSize())
+	if err != nil {
+		return err
+	}
+	scope := models.ListenerWSScope(peerID)
+	if !needsChunking {
+		_, err := transport.EnqueueWSMessage(ctx, h.rdb, scope, &models.WSMessage{
+			Type:    models.WSMessageTypePushRequest,
+			PeerID:  peerID,
+			Request: &req,
+		}, req.ID)
+		if err == nil && h.wsHub != nil {
+			h.wsHub.Notify(peerID)
+		}
+		return err
+	}
+	return h.queueNextChunkEvent(ctx, peerID, &req)
+}
+
+func (h *Handlers) queueNextChunkEvent(ctx context.Context, peerID string, req *models.RelayRequest) error {
+	if req == nil {
+		return nil
+	}
+	cursor, err := h.rdb.GetChunkCursor(ctx, models.RequestTransferID(req.ID))
+	if err != nil {
+		return err
+	}
+	nextIndex := 0
+	if cursor != nil {
+		nextIndex = cursor.NextIndex
+	}
+	chunk, err := transport.RequestChunkAt(*req, h.cfg.TransportChunkSize(), nextIndex)
+	if err != nil {
+		if strings.Contains(err.Error(), "out of range") {
+			return nil
+		}
+		return err
+	}
+	refID := fmt.Sprintf("%s:%d", chunk.TransferID, chunk.Index)
+	_, err = transport.EnqueueWSMessage(ctx, h.rdb, models.ListenerWSScope(peerID), &models.WSMessage{
+		Type:   models.WSMessageTypePushChunk,
+		PeerID: peerID,
+		Chunk:  chunk,
+	}, refID)
+	if err == nil && h.wsHub != nil {
+		h.wsHub.Notify(peerID)
+	}
+	return err
+}
+
+func (h *Handlers) storeSenderResultWS(ctx context.Context, peerID string, result *models.RelayResult) error {
+	if result == nil {
+		return nil
+	}
+	resultCtx := logger.WithRequestID(ctx, result.RequestID)
+	if err := h.rdb.StoreResult(resultCtx, result, h.cfg.ResultTTL); err != nil {
+		return err
+	}
+	webhookURL, _ := h.rdb.GetRequestWebhookURL(resultCtx, result.RequestID)
+	if webhookURL != "" {
+		webhookCtx := logger.WithComponent(context.Background(), "webhook")
+		webhookCtx = logger.WithRequestID(webhookCtx, result.RequestID)
+		webhookCtx = logger.WithPeerID(webhookCtx, peerID)
+		resultCopy := *result
+		go webhook.Deliver(webhookCtx, h.rdb, webhookURL, result.RequestID, &resultCopy, h.cfg.WebhookMaxRetries)
+	}
+	return nil
+}
+
+func (h *Handlers) applySenderChunkReceiptWS(ctx context.Context, peerID string, receipt *models.ChunkReceipt) error {
+	if receipt == nil {
+		return nil
+	}
+	if err := h.rdb.ApplyChunkReceipt(ctx, *receipt); err != nil {
+		return err
+	}
+	if receipt.Completed {
+		return nil
+	}
+	req, err := h.rdb.GetRequest(ctx, receipt.RequestID)
+	if err != nil || req == nil {
+		return err
+	}
+	return h.queueNextChunkEvent(ctx, peerID, req)
 }
 
 func (h *Handlers) waitForQueuedRequests(ctx context.Context, peerID string, timeout time.Duration) {

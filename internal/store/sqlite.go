@@ -125,6 +125,22 @@ func (s *SQLite) initSchema(ctx context.Context) error {
 			lease_until INTEGER NOT NULL DEFAULT 0,
 			updated_at INTEGER NOT NULL DEFAULT 0
 		);`,
+		`CREATE TABLE IF NOT EXISTS ws_sequence_states (
+			scope TEXT PRIMARY KEY,
+			next_outbound_seq INTEGER NOT NULL DEFAULT 0,
+			last_received_seq INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		);`,
+		`CREATE TABLE IF NOT EXISTS ws_outbox (
+			scope TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			type TEXT NOT NULL,
+			ref_id TEXT,
+			payload TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (scope, seq)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_ws_outbox_scope_seq ON ws_outbox(scope, seq);`,
 		`CREATE TABLE IF NOT EXISTS chunk_receipts (
 			transfer_id TEXT PRIMARY KEY,
 			request_id TEXT NOT NULL,
@@ -209,6 +225,22 @@ func (s *SQLite) initSchema(ctx context.Context) error {
 			expires_at INTEGER NOT NULL DEFAULT 0,
 			updated_at INTEGER NOT NULL DEFAULT 0
 		)`,
+		`CREATE TABLE IF NOT EXISTS ws_sequence_states (
+			scope TEXT PRIMARY KEY,
+			next_outbound_seq INTEGER NOT NULL DEFAULT 0,
+			last_received_seq INTEGER NOT NULL DEFAULT 0,
+			updated_at INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS ws_outbox (
+			scope TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			type TEXT NOT NULL,
+			ref_id TEXT,
+			payload TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (scope, seq)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_ws_outbox_scope_seq ON ws_outbox(scope, seq)`,
 	}
 	for _, migration := range migrations {
 		if _, err := s.db.ExecContext(ctx, migration); err != nil &&
@@ -241,7 +273,7 @@ func (s *SQLite) FlushAll(ctx context.Context) (int64, error) {
 
 	tables := []string{
 		"peers", "pairing_tokens", "listener_info", "requests", "request_queue",
-		"results", "pending_results", "sender_request_states", "chunk_receipts", "chunk_cursors",
+		"results", "pending_results", "sender_request_states", "ws_sequence_states", "ws_outbox", "chunk_receipts", "chunk_cursors",
 		"inbound_chunks", "api_tokens", "proxies",
 	}
 	var total int64
@@ -727,6 +759,22 @@ func (s *SQLite) GetRequestStatus(ctx context.Context, requestID string) (models
 		return "", err
 	}
 	return models.RequestStatus(status), nil
+}
+
+func (s *SQLite) GetRequest(ctx context.Context, requestID string) (*models.RelayRequest, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT data FROM requests WHERE id = ?`, requestID)
+	var data string
+	if err := row.Scan(&data); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var req models.RelayRequest
+	if err := json.Unmarshal([]byte(data), &req); err != nil {
+		return nil, fmt.Errorf("unmarshal request %s: %w", requestID, err)
+	}
+	return &req, nil
 }
 
 func (s *SQLite) GetRequestWebhookURL(ctx context.Context, requestID string) (string, error) {

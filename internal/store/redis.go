@@ -17,7 +17,7 @@ type Redis struct {
 }
 
 // NewRedis creates a new Redis client and verifies the connection.
-func NewRedis(addr string, password string, db int) (*Redis, error) {
+func NewRedis(addr string, password string, db int, poolSize int) (*Redis, error) {
 	ctx := logger.WithComponent(context.Background(), "store")
 
 	slog.InfoContext(ctx, "connecting to Redis", "addr", addr, "db", db)
@@ -29,7 +29,7 @@ func NewRedis(addr string, password string, db int) (*Redis, error) {
 		DialTimeout:  5 * time.Second,
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
-		PoolSize:     10,
+		PoolSize:     poolSize,
 	})
 
 	// Verify connection
